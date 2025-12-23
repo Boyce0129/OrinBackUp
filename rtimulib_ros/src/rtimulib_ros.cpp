@@ -30,7 +30,7 @@ public:
         imu_->setSlerpPower(0.02);
         imu_->setGyroEnable(true);
         imu_->setAccelEnable(true);
-        imu_->setCompassEnable(false);
+        imu_->setCompassEnable(true);
 
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(static_cast<int>(1000.0 / update_rate_)),

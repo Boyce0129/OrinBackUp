@@ -13,7 +13,7 @@ import math
 
 
 DEVICE = 0x76 # Default device I2C address
-bus = smbus.SMBus(7)
+bus = smbus.SMBus(1)
 
 def getShort(data, index):
   # return two bytes from data as a signed 16-bit value

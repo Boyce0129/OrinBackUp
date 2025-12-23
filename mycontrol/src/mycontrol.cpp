@@ -1,4 +1,30 @@
+// ============================ CHANGELOG =====================================
+// [A] 採用ENU坐標系，IMU和GPS皆在本程式轉換
+//
+// [B] - 到點判定只看 z
+//
+// [D] 指令介面：'on' / 'l' / 'run' / <z>
+//
+// [E] GPS 丟失新邏輯（取代舊的 gps_loss_detected）：
+//     - 在懸停或移動模式下，一旦判定 GPS 丟失：啟動 fallback，將總推力 U1 = 17.65 N，
+//       不再依靠 z_command 做控制，phi/theta 命令維持 0，z_target 不變。
+//     - GPS 恢復：若在懸停 → 取消 fallback、恢復 Z 控制器；
+//                若在移動 → 取消 fallback、將 z_command 置為目前高度，vz_ref=0，
+//                               讓斜坡器從「當前高度」再次朝 z_target 移動。
+//
+// [f] 輸入run之後，z_command = z_target直接設為0.1(直接hovering)
+//
+// [g] 更新迴圈頻率偵測邏輯，目前為「每運行50個迴圈，便打印當前迴圈與上一個迴圈的間隔時間」
+//     CTRL+F「sleep_time」以調整主迴圈頻率(即姿態迴圈頻率)
+//     注意，主迴圈頻率更改後，位置控制迴圈頻率也會更改
+//
+// [h] 加入水平位置控制器且固定為 x = y = 0 且不可使用指令更改
+//
+// [I] 加入了Z軸方向的PID控制
+// ============================================================================
+
 #include <iostream>
+#include <sstream>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -10,8 +36,8 @@
 #include <thread>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
-#include <csignal> 
+#include <nav_msgs/msg/odometry.hpp>
+#include <csignal>
 #include <sys/select.h>
 #include <fcntl.h>
 #include <cmath>
@@ -19,16 +45,17 @@
 #include <vector>
 #include <stdexcept>
 #include <utility>
-#include "my_msg/msg/bmp280.hpp"
 #include <fstream>
-
+#include <limits>
+#include <deque>
+#include <atomic>
+#include <termios.h>
 
 extern "C" {
     #include <linux/i2c.h>
     #include <linux/i2c-dev.h>
     #include <i2c/smbus.h>
 }
-
 
 // PCA9685 Registers
 #define MODE1 0x00
@@ -41,32 +68,50 @@ extern "C" {
 // I2C Address of PCA9685
 #define PCA9685_ADDRESS 0x40
 
-std::string command = "";
-std::mutex commandMutex;
-std::atomic<bool> running(true);
+// ====== 共享指令狀態 ======
+std::atomic<bool> running{true};
+std::atomic<bool> sbus_running{true};
 
 void signal_handler(int signal) {
     if (signal == SIGINT) {
         running = false;
-        rclcpp::shutdown();  // 关闭 ROS 2
+        sbus_running = false;
+        rclcpp::shutdown();
     }
 }
 
+// ====== ROS2: 訂閱 IMU 與 RTK Odom ======
 class MultiTopicSubscriber : public rclcpp::Node {
 public:
     MultiTopicSubscriber()
     : Node("multi_topic_subscriber") {
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
             "imu", 10, std::bind(&MultiTopicSubscriber::imuCallback, this, std::placeholders::_1));
-    
+        gps_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+            "rtk/odom", 10, std::bind(&MultiTopicSubscriber::gpsCallback, this, std::placeholders::_1));
 
+        last_imu_data_.orientation.w = 1.0;
+        last_imu_data_.orientation.x = 0.0;
+        last_imu_data_.orientation.y = 0.0;
+        last_imu_data_.orientation.z = 0.0;
+        last_imu_data_.angular_velocity.x = 0.0;
+        last_imu_data_.angular_velocity.y = 0.0;
+        last_imu_data_.angular_velocity.z = 0.0;
+
+        last_gps_data_.pose.pose.position.x = 0.0;
+        last_gps_data_.pose.pose.position.y = 0.0;
+        last_gps_data_.pose.pose.position.z = 0.0;
+        last_gps_data_.twist.twist.linear.x = 0.0;
+        last_gps_data_.twist.twist.linear.y = 0.0;
+        last_gps_data_.twist.twist.linear.z = 0.0;
+
+        last_imu_timestamp_ = 0.0;
+        last_gps_timestamp_ = 0.0;
     }
 
-
-    void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+    double get_last_imu_timestamp() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        new_imu_data_available_ = true;
-        last_imu_data_ = *msg;
+        return last_imu_timestamp_;
     }
 
     sensor_msgs::msg::Imu get_last_imu_data() {
@@ -75,69 +120,66 @@ public:
         return last_imu_data_;
     }
 
+    double get_last_gps_timestamp() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_gps_timestamp_;
+    }
+
+    nav_msgs::msg::Odometry get_last_gps_data() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_gps_data_;
+    }
+
     bool new_imu_data_available() const {
         return new_imu_data_available_;
     }
 
+private:
+    void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        new_imu_data_available_ = true;
+        last_imu_data_ = *msg;
+        last_imu_timestamp_ = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+    }
 
-    private:
+    void gpsCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_gps_data_ = *msg;
+        last_gps_timestamp_ = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+    }
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr gps_sub_;
     mutable std::mutex mutex_;
     sensor_msgs::msg::Imu last_imu_data_;
+    nav_msgs::msg::Odometry last_gps_data_;
+    double last_imu_timestamp_;
+    double last_gps_timestamp_;
     bool new_imu_data_available_ = false;
-
 };
 
-
+// ====== FOHP 一階＋半帶寬差分器 ======
 class FOHPDerivative {
 private:
+    double y[3];
     double dt;
     double alpha;
-    std::vector<double> y;
-
 public:
-    FOHPDerivative(double alpha) : alpha(alpha) {
-        y = std::vector<double>(3, 0.0); // 初始化为三个零
+    FOHPDerivative(double dt_init, double alpha_init) : dt(dt_init), alpha(alpha_init) {
+        y[0] = y[1] = y[2] = 0;
     }
-
-    void updateDt(double newdt) {
-        dt = newdt;
+    void updateDt(double new_dt) {
+        if (new_dt > 0) dt = new_dt;
     }
-
-    double compute(double new_input) {
-        // 更新历史数据
+    double update(double new_value) {
         y[0] = y[1];
         y[1] = y[2];
-        y[2] = new_input;
-
-        // 计算微分
+        y[2] = new_value;
         return (1 - alpha) * (y[2] - y[1]) / dt + alpha * (y[2] - y[0]) / (2 * dt);
     }
 };
 
-
-class FusionKalmanFilter {
-public:
-    double estimate;
-    double cov_estimate;
-
-    FusionKalmanFilter(double init_estimate, double init_cov)
-        : estimate(init_estimate), cov_estimate(init_cov) {}
-
-    void update(double gps_estimate, double gps_cov, double baro_estimate, double baro_cov) {
-        // First update with GPS data
-        double K_gps = cov_estimate / (cov_estimate + gps_cov);
-        estimate = estimate + K_gps * (gps_estimate - estimate);
-        cov_estimate = (1 - K_gps) * cov_estimate;
-
-        // Second update with Barometer data
-        double K_baro = cov_estimate / (cov_estimate + baro_cov);
-        estimate = estimate + K_baro * (baro_estimate - estimate);
-        cov_estimate = (1 - K_baro) * cov_estimate;
-    }
-};
-
+// ====== PCA9685 基本函式 ======
 void writeRegister(int file, int registerAddress, int value) {
     char buffer[2];
     buffer[0] = registerAddress;
@@ -147,24 +189,22 @@ void writeRegister(int file, int registerAddress, int value) {
     }
 }
 
-// Function to set PWM frequency
 void setPWMFreq(int file, int freq) {
-    float prescaleval = 25000000.0; // 25MHz
-    prescaleval /= 4096.0;          // 12-bit
+    float prescaleval = 25000000.0;
+    prescaleval /= 4096.0;
     prescaleval /= float(freq);
     prescaleval -= 1.0;
     int prescale = int(prescaleval + 0.5);
 
     int oldmode = i2c_smbus_read_byte_data(file, MODE1);
-    int newmode = (oldmode & 0x7F) | 0x10; // sleep
-    writeRegister(file, MODE1, newmode);    // go to sleep
+    int newmode = (oldmode & 0x7F) | 0x10;
+    writeRegister(file, MODE1, newmode);
     writeRegister(file, PRESCALE, prescale);
     writeRegister(file, MODE1, oldmode);
     usleep(5000);
     writeRegister(file, MODE1, oldmode | 0x80);
 }
 
-// Function to set PWM output
 void setPWM(int file, int channel, int on, int off) {
     writeRegister(file, LED0_ON_L + 4 * channel, on & 0xFF);
     writeRegister(file, LED0_ON_H + 4 * channel, on >> 8);
@@ -172,854 +212,1062 @@ void setPWM(int file, int channel, int on, int off) {
     writeRegister(file, LED0_OFF_H + 4 * channel, off >> 8);
 }
 
+// ====== 姿態工具 ======
 void quaternionToEuler(float qx, float qy, float qz, float qw, float& roll, float& pitch, float& yaw) {
-    roll = std::atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
-    pitch = (-1) *(std::asin(2.0 * (qw * qy - qz * qx)));
-    yaw = (-1) *std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
+    roll  = std::atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
+    pitch = (-1) * (std::asin(2.0 * (qw * qy - qz * qx))) + 0.022; // 你的偏置保留
+    yaw   = (-1) * std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
 }
 
-// void quaternionToEuler(float qx, float qy, float qz, float qw, float& roll, float& pitch, float& yaw) {
-//      roll = std::asin(2.0 * (qw * qy - qz * qx));
-//      pitch = (-1) * std::atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
-//      yaw = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
-// }
 
-// void quaternionToEuler(float qx, float qy, float qz, float qw, float& roll, float& pitch, float& yaw) {
-//     // 計算原始歐拉角
-//     roll = std::asin(2.0 * (qw * qy - qz * qx));
-//     pitch = (-1) * std::atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
-//     yaw = std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
-
-//     // 補償 X 方向 (Roll) 1.4507 度的安裝誤差
-//     const float roll_error_degrees = 1.07f; // X 方向誤差 (度)
-//     const float roll_error_radians = roll_error_degrees * M_PI / 180.0f; // 轉換為弧度
-//     roll -= roll_error_radians;
-
-//     // 補償 Y 方向 (Pitch) -0.2764 度的安裝誤差
-//     const float pitch_error_degrees = -0.07f; // Y 方向誤差 (度)
-//     const float pitch_error_radians = pitch_error_degrees * M_PI / 180.0f; // 轉換為弧度
-//     pitch -= pitch_error_radians; // 注意這裡使用 -=，因為 pitch 已取反
-
-//     // 確保 roll、pitch 和 yaw 在 [-π, π] 範圍內
-//     if (roll > M_PI) {
-//         roll -= 2.0f * M_PI;
-//     } else if (roll < -M_PI) {
-//         roll += 2.0f * M_PI;
-//     }
-//     if (pitch > M_PI) {
-//         pitch -= 2.0f * M_PI;
-//     } else if (pitch < -M_PI) {
-//         pitch += 2.0f * M_PI;
-//     }
-//     if (yaw > M_PI) {
-//         yaw -= 2.0f * M_PI;
-//     } else if (yaw < -M_PI) {
-//         yaw += 2.0f * M_PI;
-//     }
-// }
-const double EARTH_RADIUS = 6371000.0;// 地球半径，单位：米
-
-double toRadians(double degrees) {
-    return degrees * M_PI / 180.0;
-}// 将度转换为弧度
-
-
-void calculateDistance(double lat1, double lon1, double alt1, 
-                       double lat2, double lon2, double alt2,
-                       double& distanceEast, double& distanceNorth, double& altitudeDifference) {
-    double lat1Rad = toRadians(lat1);
-    double lat2Rad = toRadians(lat2);
-    double deltaLat = toRadians(lat2 - lat1);
-    double deltaLon = toRadians(lon2 - lon1);
-
-    // 计算北向和东向距离
-    distanceNorth = deltaLat * EARTH_RADIUS;
-    distanceEast = deltaLon * EARTH_RADIUS * cos((lat1Rad + lat2Rad) / 2);
-
-    // 计算高度差
-    altitudeDifference = alt2 - alt1;
+// ====== NDOB ======
+void ndob_x(double x_Dot, double phi, double theta, double psi, double dt, double U1, double z_x_old, double& d_x, double& z_x, double l_x) {
+    const double m = 1.82, g = 9.807, Cv = 0.01;
+    double p_x = l_x * x_Dot;
+    double z_x_Dot = l_x * (((-cos(phi) * sin(theta) * cos(psi) + sin(phi) * sin(psi)) * U1 / m) + Cv * (x_Dot / m)) - l_x * z_x_old - l_x * p_x;
+    z_x = z_x_Dot * dt;
+    d_x = z_x + p_x;
+}
+void ndob_y(double y_Dot, double phi, double theta, double psi, double dt, double U1, double z_y_old, double& d_y, double& z_y, double l_y) {
+    const double m = 1.82, g = 9.807, Cv = 0.01;
+    double p_y = l_y * y_Dot;
+    double z_y_Dot = l_y * (((-cos(phi) * sin(theta) * sin(psi) - sin(phi) * cos(psi)) * U1 / m) + Cv * (y_Dot / m)) - l_y * z_y_old - l_y * p_y;
+    z_y = z_y_Dot * dt;
+    d_y = z_y + p_y;
+}
+void ndob_z(double z_Dot, double phi, double theta, double dt, double U1, double z_z_old, double& d_z, double& z_z, double l_z) {
+    const double m = 1.82, g = 9.807, Cv = 0.01;
+    double p_z = l_z * z_Dot;
+    double z_z_Dot = l_z * ((g + -(cos(phi) * cos(theta) * U1 / m)) + Cv * (z_Dot / m)) - l_z * z_z_old - l_z * p_z;
+    z_z = z_z_Dot * dt;
+    d_z = z_z + p_z;
+}
+void ndob_phi(double phi_Dot, double theta_Dot, double psi_Dot, double dt, double u_phi, double omega, double z_phi_old, double& d_phi, double& z_phi, double l_phi) {
+    const double Ixx = 0.015326, Iyy = 0.014583, Izz = 0.017339, Jtp = 4.103e-4;
+    double p_phi = l_phi * phi_Dot;
+    double z_phi_Dot = (l_phi * (((-(Iyy - Izz) * theta_Dot * psi_Dot) / Ixx) + ((Jtp / Ixx) * theta_Dot * omega) - (u_phi))) - (l_phi * z_phi_old) - (l_phi * p_phi);
+    z_phi = z_phi_Dot * dt;
+    d_phi = z_phi + p_phi;
+}
+void ndob_theta(double phi_Dot, double theta_Dot, double psi_Dot, double dt, double u_theta, double omega, double z_theta_old, double& d_theta, double& z_theta, double l_theta) {
+    const double Ixx = 0.015326, Iyy = 0.014583, Izz = 0.017339, Jtp = 4.103e-4;
+    double p_theta = l_theta * theta_Dot;
+    double z_theta_Dot = (l_theta * (((-(Izz - Ixx) * phi_Dot * psi_Dot) / Iyy) - ((Jtp / Iyy) * phi_Dot * omega) - (u_theta))) - (l_theta * z_theta_old) - (l_theta * p_theta);
+    z_theta = z_theta_Dot * dt;
+    d_theta = z_theta + p_theta;
+}
+void ndob_psi(double phi_Dot, double theta_Dot, double psi_Dot, double dt, double u_psi, double omega, double z_psi_old, double& d_psi, double& z_psi, double l_psi) {
+    const double Ixx = 0.015326, Iyy = 0.014583, Izz = 0.017339, Jtp = 4.103e-4;
+    double p_psi = l_psi * psi_Dot;
+    double z_psi_Dot = (l_psi * (((-(Ixx - Iyy) * theta_Dot * phi_Dot) / Izz) - (u_psi))) - (l_psi * z_psi_old) - (l_psi * p_psi);
+    z_psi = z_psi_Dot * dt;
+    d_psi = z_psi + p_psi;
 }
 
-typedef std::pair<double, double> DataPoint;
-double linearInterpolate(double x, const DataPoint& p1, const DataPoint& p2) {
-    double slope = (p2.second - p1.second) / (p2.first - p1.first);
-    return p1.second + slope * (x - p1.first);
-} 
+std::atomic<float> ch_norm[5];
 
+void init_sbus_vars() {
+    for (int i = 0; i < 5; ++i) {
+        ch_norm[i].store(0.0f);
+    }
+}
 
-double interpolate(double x, const std::vector<DataPoint>& dataPoints) {
-    for (size_t i = 0; i < dataPoints.size() - 1; ++i) {
-        if (x >= dataPoints[i].first && x <= dataPoints[i + 1].first) {
-            return linearInterpolate(x, dataPoints[i], dataPoints[i + 1]);
+void sbusThread() {
+    const char* PORT_PATH = "/dev/ttyUSB0";
+    constexpr size_t FRAME_SIZE = 35;
+    constexpr uint8_t START_BYTE = 0x0F;
+    constexpr int BAUD = B115200;
+
+    auto open_serial = [&]() {
+        int fd = open(PORT_PATH, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+        if (fd < 0) { 
+            perror("SBUS open");
+            std::cerr << "⚠️ 無法開啟 " << PORT_PATH << std::endl;
+            return -1; 
+        }
+
+        termios tio{};
+        cfmakeraw(&tio);
+        cfsetispeed(&tio, BAUD);
+        cfsetospeed(&tio, BAUD);
+        tio.c_cflag |= (CLOCAL | CREAD);
+        tio.c_cflag &= ~PARENB;
+        tio.c_cflag &= ~CSTOPB;
+        tio.c_cflag &= ~CRTSCTS;
+        tio.c_cc[VMIN] = 0;
+        tio.c_cc[VTIME] = 1;
+        tcsetattr(fd, TCSANOW, &tio);
+        tcflush(fd, TCIFLUSH);
+
+        // 設置 DTR 和 RTS 信號（關鍵！）
+        int mstat;
+        if (ioctl(fd, TIOCMGET, &mstat) == 0) {
+            mstat |= TIOCM_DTR;   // DTR 拉高
+            mstat &= ~TIOCM_RTS;  // RTS 拉低
+            ioctl(fd, TIOCMSET, &mstat);
+        }
+        
+        // 等待串口穩定
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        
+        std::cout << "✓ SBUS 串口已開啟" << std::endl;
+        return fd;
+    };
+
+    std::cout << "啟動 SBUS 執行緒..." << std::endl;
+    int fd = open_serial();
+    if (fd < 0) {
+        std::cerr << "❌ SBUS 執行緒無法啟動" << std::endl;
+        sbus_running = false;
+        return;
+    }
+
+    std::vector<uint8_t> buf;
+    buf.reserve(1024);  // 增加緩衝區大小
+
+    constexpr int raw_min[5] = {311, 306, 308, 306, 306};
+    constexpr int raw_max[5] = {1693, 1688, 1730, 1693, 1694};
+
+    uint8_t frame[FRAME_SIZE];
+    auto last_rx = std::chrono::steady_clock::now();
+    bool first_frame = true;
+    int reconnect_count = 0;
+
+    std::cout << "等待 SBUS 訊號同步..." << std::flush;
+
+    while (sbus_running) {
+        uint8_t tmp[256];  // 增加讀取緩衝區
+        ssize_t n = read(fd, tmp, sizeof(tmp));
+        
+        if (n > 0) {
+            buf.insert(buf.end(), tmp, tmp + n);
+            last_rx = std::chrono::steady_clock::now();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        // === 自動重連機制：0.5秒沒資料就重開串口 ===
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - last_rx).count() > 0.5) {
+            if (!first_frame) {
+                std::cout << "\n⚠️ SBUS 訊號中斷，重新連接中..." << std::flush;
+            } else {
+                std::cout << " 重試中..." << std::flush;
+            }
+            
+            close(fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            fd = open_serial();
+            
+            if (fd < 0) {
+                reconnect_count++;
+                if (reconnect_count > 10) {
+                    std::cerr << "\n❌ SBUS 重連失敗次數過多，執行緒終止" << std::endl;
+                    sbus_running = false;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            
+            buf.clear();
+            last_rx = std::chrono::steady_clock::now();
+            reconnect_count = 0;
+            continue;
+        }
+
+        if (buf.size() < FRAME_SIZE) continue;
+
+        auto it = std::find(buf.begin(), buf.end(), START_BYTE);
+        if (it == buf.end()) { 
+            buf.clear(); 
+            continue; 
+        }
+
+        size_t idx = it - buf.begin();
+        if (buf.size() - idx < FRAME_SIZE) continue;
+
+        memcpy(frame, &buf[idx], FRAME_SIZE);
+        buf.erase(buf.begin(), buf.begin() + idx + FRAME_SIZE);
+
+        if (frame[0] != START_BYTE) continue;
+
+        // XOR 校驗
+        uint8_t xor_val = 0;
+        for (int i = 1; i <= 33; ++i) xor_val ^= frame[i];
+        if (xor_val != frame[34]) continue;
+
+        // 解析並正規化通道數據
+        for (int i = 0; i < 5; ++i) {
+            uint16_t raw = (uint16_t(frame[1 + 2 * i]) << 8) | frame[2 + 2 * i];
+            float scale = 2.0f / float(raw_max[i] - raw_min[i]);
+            ch_norm[i] = (raw - raw_min[i]) * scale - 1.0f;
+        }
+
+        // 首次接收到有效幀
+        if (first_frame) {
+            std::cout << " 完成！" << std::endl;
+            std::cout << "✓ SBUS 開始接收數據 (CH5 = " 
+                      << std::fixed << std::setprecision(3) 
+                      << ch_norm[4].load() << ")" << std::endl;
+            first_frame = false;
+        }
+
+        // 檢查 flag 狀態（failsafe 等）
+        uint8_t flags = frame[33];
+        if (flags & 0x20) {
+            static auto last_warning = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - last_warning).count() > 2.0) {
+                std::cerr << "⚠️ SBUS 訊號丟失" << std::endl;
+                last_warning = now;
+            }
+        }
+        if (flags & 0x10) {
+            static auto last_warning = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - last_warning).count() > 2.0) {
+                std::cerr << "⚠️ SBUS Failsafe 觸發" << std::endl;
+                last_warning = now;
+            }
         }
     }
-    // 如果 x 超出了数据点的范围，返回一个错误值
-    return -1; // 或者可以抛出一个异常
+
+    close(fd);
+    std::cout << "SBUS 執行緒已停止" << std::endl;
 }
 
+
+// ====== 主控制執行緒 ======
 struct VariablesGroup {
-    std::vector<double> group; // 使用vector来存储每组的变量
+    std::vector<std::string> names;
+    std::vector<double> group;
+    VariablesGroup(const std::vector<std::string>& n, const std::vector<double>& g) : names(n), group(g) {}
+    VariablesGroup() = default;
 };
 
+void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& node, std::ofstream& outFile1, std::ofstream& outFile2) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-void ndob_phi(double phi_Dot,double theta_Dot,double psi_Dot,double dt,double u_phi,double omega,double z_phi_old,double& d_phi,double& z_phi)
-{
-    const double Ixx = 0.01885; // kg*m^2
-    const double Iyy = 0.01837; // kg*m^2
-    const double Izz = 0.01774; // kg*m^2
-    const double m = 1.995;     // kg
-    const double g = 9.81;      // m/s^2
-    const double Jtp = 4.103e-4;
-    const double l_phi = 6;
-    double p_phi=l_phi*phi_Dot;
-    double z_phi_Dot=(l_phi*(((-(Iyy-Izz)*theta_Dot*psi_Dot)/Ixx)+((Jtp/Ixx)*theta_Dot*omega)-(u_phi)))-(l_phi*z_phi_old)-(l_phi*p_phi);
-    z_phi=z_phi_Dot*dt;
-    d_phi=z_phi+p_phi;
+    static auto program_start = std::chrono::high_resolution_clock::now();
 
-}
+    std::chrono::time_point<std::chrono::high_resolution_clock> last_position_update = program_start;
+    std::chrono::time_point<std::chrono::high_resolution_clock> last_attitude_update = program_start;
 
+    const std::chrono::milliseconds position_update_interval(100); // 10Hz
+    const std::chrono::milliseconds attitude_update_interval(10);  // 100Hz
+    const std::chrono::milliseconds gps_timeout(1000);
+    const std::chrono::seconds imu_detection_delay(5);
+    const std::chrono::milliseconds imu_timeout(100);
 
-void ndob_theta(double phi_Dot,double theta_Dot,double psi_Dot,double dt,double u_theta,double omega,double z_theta_old,double& d_theta,double& z_theta)
-{
-    const double Ixx = 0.01885; // kg*m^2
-    const double Iyy = 0.01837; // kg*m^2
-    const double Izz = 0.01774; // kg*m^2
-    const double m = 1.995;     // kg
-    const double g = 9.81;      // m/s^2
-    const double Jtp = 4.103e-4;
-    const double l_theta = 6;
-    double p_theta=l_theta*theta_Dot;
-    double z_theta_Dot=(l_theta*(((-(Izz-Ixx)*phi_Dot*psi_Dot)/Iyy)-((Jtp/Iyy)*phi_Dot*omega)-(u_theta)))-(l_theta*z_theta_old)-(l_theta*p_theta);
-    z_theta=z_theta_Dot*dt;
-    d_theta=z_theta+p_theta;
-
-}
-
-void ndob_psi(double phi_Dot,double theta_Dot,double psi_Dot,double dt,double u_psi,double omega,double z_psi_old,double& d_psi,double& z_psi)
-{
-    const double Ixx = 0.01885; // kg*m^2
-    const double Iyy = 0.01837; // kg*m^2
-    const double Izz = 0.01774; // kg*m^2
-    const double m = 1.995;     // kg
-    const double g = 9.81;      // m/s^2
-    const double Jtp = 4.103e-4;
-    const double l_psi = 3;
-    double p_psi=l_psi*psi_Dot;
-    double z_psi_Dot=(l_psi*(((-(Ixx-Iyy)*theta_Dot*phi_Dot)/Izz)-(u_psi)))-(l_psi*z_psi_old)-(l_psi*p_psi);
-    z_psi=z_psi_Dot*dt;
-    d_psi=z_psi+p_psi;
-
-}
-
-void commandInputThread() {
-    fd_set readfds;
-    struct timeval tv;
-    int retval;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000; // 100 毫秒
-
-    while (running){
-        FD_SET(STDIN_FILENO, &readfds);
-
-        retval = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
-
-        if (retval == -1) {
-            perror("select()");
-            break;
-        } else if (retval) {
-            std::string newCommand;
-            std::cin >> newCommand;
-            {
-                std::lock_guard<std::mutex> lock(commandMutex);
-                command = newCommand;
-            }
-        } else {
-           
-        }
-
-        if (!running) {
-            
-            break;
-        }
-    }
-}
+    const float max_angle = 15.0f * M_PI / 180.0f;
+    const double XY_RADIUS_LIMIT = 0.6;   // 若有使用 XY 超界（僅關機保護）
+    const double Z_RADIUS_LIMIT  = 0.35;   // 0.15 m
+    const double Z_VELOCITY_LIMIT = 0.4;   // m/s
 
 
+    std::mutex dataMutex;
 
-void droneControlThread(int file,const std::shared_ptr<MultiTopicSubscriber>& node,std::ofstream& outFile1,std::ofstream& outFile2) {
-   
-    FOHPDerivative theta_command_Derivative(0.5); // 假设 alpha = 0.5
-    FOHPDerivative phi_command_Derivative(0.5);
-    FOHPDerivative psi_command_Derivative(0.5);
-    FOHPDerivative theta_command_sec_Derivative(0.5);
-    FOHPDerivative phi_command_sec_Derivative(0.5);
-    FOHPDerivative psi_command_sec_Derivative(0.5);
-    FOHPDerivative x_command_Derivative(0.5);
-    FOHPDerivative y_command_Derivative(0.5);
-    FOHPDerivative z_command_Derivative(0.5);
-    FOHPDerivative x_command_sec_Derivative(0.5);
-    FOHPDerivative y_command_sec_Derivative(0.5);
-    FOHPDerivative z_command_sec_Derivative(0.5);
-    // FOHPDerivative theta_Derivative(0.5);
-    // FOHPDerivative phi_Derivative(0.5);
-    // FOHPDerivative psi_Derivative(0.5);
+    // 保留：IMU相關
+    std::atomic<bool> imu_loss_detected{false};
+    std::atomic<bool> attitude_invalid{false};
 
-    FOHPDerivative x_Derivative(0.65);
-    FOHPDerivative y_Derivative(0.65);
-    FOHPDerivative z_Derivative(0.65);
+    // （僅保護用）XYZ 超界
+    std::atomic<bool> xy_exceeded{false};
+    std::atomic<bool> z_exceeded{false};
+    std::atomic<bool> z_vel_exceeded{false};  // Z 速度是否超界
 
 
-    double psi_command_initial;
-    double theta_command=0;
-    double phi_command=0;
-    double psi_command=0;
-    double x_command=0;
-    double y_command=0;
-    double z_command=0;
+    // 位置狀態（只需 z，x/y 讀回但不控制）
+    double current_x = 0.0, current_y = 0.0, current_z = 0.0;
+
+    // 姿態量測
+    float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+
+    // GPS 新/舊時間戳追蹤（新的 GPS 丟失偵測法）
+    double last_gps_timestamp_seen = 0.0;
+    auto   last_gps_wallclock = program_start;
+
+    static double last_position_time = 0.0;
+    static double last_attitude_time = 0.0;
+
+    bool control_mode_on = false, motors_on = false;
+
+    // ====== 目標與命令 ======
+    double x_target = 0.0, y_target = 0.0, z_target = 0.0;
+    double x_command = 0.0, y_command = 0.0, z_command = 0.0;
+
+    static double stored_uz = 0.0;
+
+    // FOHP 導數器（僅 z + 姿態）
+    FOHPDerivative x_command_Derivative(0.1, 0.5);
+    FOHPDerivative y_command_Derivative(0.1, 0.5);
+    FOHPDerivative z_command_Derivative(0.1, 0.5);
+    FOHPDerivative x_command_sec_Derivative(0.1, 0.5);
+    FOHPDerivative y_command_sec_Derivative(0.1, 0.5);
+    FOHPDerivative z_command_sec_Derivative(0.1, 0.5);
+    FOHPDerivative phi_command_Derivative(0.01, 0.5);
+    FOHPDerivative theta_command_Derivative(0.01, 0.5);
+    FOHPDerivative psi_command_Derivative(0.01, 0.5);
+    FOHPDerivative phi_command_sec_Derivative(0.01, 0.5);
+    FOHPDerivative theta_command_sec_Derivative(0.01, 0.5);
+    FOHPDerivative psi_command_sec_Derivative(0.01, 0.5);
+
+    // FOHPDerivative vz_e_derivative(0.1, 0.5);  // 初始化微分計算器，dt_position 和 alpha 可以根據需要調整
 
 
-    const double Ixx = 0.01885; // kg*m^2
-    const double Iyy = 0.01837; // kg*m^2
-    const double Izz = 0.01774; // kg*m^2
-    const double m = 1.995;     // kg
-    const double g = 9.81;      // m/s^2
-    const double Jtp = 4.103e-4;
-    const double l = 0.19;
-    const double Cv=0.01;
-    const double bound=0.1;
-    const double position_command_bound_derivative=0.05;
-    const double position_command_bound_sec_derivative=0.5;
-    
-    const double attitude_command_bound=15;
-    const double attitude_command_bound_derivative=0.5;
-    const double attitude_command_bound_sec_derivative=5;
+    // 參數
+    const double Ixx = 0.015326, Iyy = 0.014583, Izz = 0.017339;
+    const double m = 1.82, g = 9.807, Jtp = 4.103e-4, Cv = 0.01;
+    const double WEIGHT_FORCE = m * g; // N（GPS fallback 用）
+    const double bound = 0.1;
+    const double position_command_bound_derivative = 0.1;  // m/s
+    const double position_command_bound_sec_derivative = 1.0; // m/s^2
+    const double attitude_command_bound_derivative = 3.1416;
+    const double attitude_command_bound_sec_derivative = 31.4159;
 
-
-    const double position_bound_derivative=0.5;
-
-
-    const double CEP=0.8;
-
-    double position_dt=0.07;
-    double attuide_dt=0.0105;
-
-    double U1=0;
-    double U2=0;
-    double U3=0;
-    double U4=0;
-    double omega=0;
-
-    double ux=0;
-    double uy=0;
-    double uz=0;
-
-
-    double d_phi=0;
-    double z_phi=0;
-    double z_phi_new=0;
-    double d_theta=0;
-    double z_theta=0;
-    double z_theta_new=0;
-    double d_psi=0;
-    double z_psi=0;
-    double z_psi_new=0;
-
-
-    std::vector<double> C = {0.5,0.5,1,10,10,5};
-    std::vector<double> K = {1,1,1,35,35,2};
+    // SMC gains
+    std::vector<double> C = {2, 2, 1, 4, 4, 4};
+    std::vector<double> K = {2, 2, 1, 6, 6, 3};
     std::vector<double> Eta = {0.1, 0.1, 0.1, 0.1, 0.1, 0.1};
+    std::vector<double> L = {1, 1, 1, 7, 7, 3};
+    std::vector<double> PID = {1.5, 1.0, 0.3, 0.1, 0.5, -0.5};
+    double I_vz_e = 0.0; // 積分項初始化
+
+    // 位置控制比例增益
+    // 速度控制比例增益
+    // 速度控制積分增益
+    // 速度控制微分增益
+    // 積分項最大值（根據需求調整）
+    // 積分項最小值（根據需求調整）
 
 
-
-    std::vector<DataPoint> rotorspeed_change = {
-    {600,630.38},{610,660.15},{620,694.08},{630,725.81},{640,756.50},{650,801.00},{660,817.76},{670,846.87},{680,876.82},
-    {690,919.96},{700,932.42},{710,959.97},{720,984.68},{730,1012.12},{740,1038.51},{750,1068.35},{760,1082.91},
-    {770,1105.53},{780,1127.83},{790,1167.52},{800,1194.96},{810,1219.04},{820,1241.77}
-
-    };
-
-    std::vector<DataPoint> rotorforce_change = {
-    {2.410,600}, {2.626,610}, {2.940,620}, {3.234,630}, {3.498,640}, {3.792,650}, {4.194,660}, {4.508,670},
-    {4.998,680}, {5.292,690}, {5.605,700}, {5.997,710}, {6.321,720}, {6.713,730}, {6.997,740}, {7.487,750}, 
-    {7.869,760}, {8.143,770}, {8.447,780}, {8.712,790}, {8.957,800}, {9.359,810}, {9.751,820}
-    };
-
-    bool flag=true;
-
-    double max_force=9;
-    double min_force=2.5;
-    double max_sign=800;
-    double min_sign=600;
-    int i=0;
-
-
-    int count =0;
-    int index2=1;
-    int index1=1;
-    double initial_x_gps=0;
-    double initial_y_gps=0;
-    double initial_z_gps=0;
-
-    double initial_cov = 1.0;     // 初始協方差
-    double gps_cov = 5.0;         // GPS 的測量協方差
-    double barometer_cov = 1.5;   // 氣壓計的測量協方差
-    FusionKalmanFilter kf_fusion(0, 1.0);
-
-
-    float initial_roll;float initial_pitch; float initial_yaw;
-    for(int i=0;i<100;i++)
-    { 
-    while (!node->new_imu_data_available()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    outFile1 << "滑模參數C: ";
+    for (double param : C) {
+        outFile1 << param << " ";
     }
-    auto initial_imu_data = node->get_last_imu_data(); 
-    float initial_qx = initial_imu_data.orientation.x;
-    float initial_qy = initial_imu_data.orientation.y;
-    float initial_qz = initial_imu_data.orientation.z;
-    float initial_qw = initial_imu_data.orientation.w;
-    quaternionToEuler(initial_qx, initial_qy, initial_qz, initial_qw, initial_roll, initial_pitch, initial_yaw);
-    psi_command+=initial_yaw;
+    outFile1 << "\n";
+
+    outFile1 << "滑模參數K: ";
+    for (double param : K) {
+        outFile1 << param << " ";
     }
-    psi_command_initial=psi_command/100;
+    outFile1 << "\n";
 
-    std::cout << "Init successful"  << std::endl;
+    outFile1 << "滑模參數Eta: ";
+    for (double param : Eta) {
+        outFile1 << param << " ";
+    }
+    outFile1 << "\n";
 
-        while (running) {
-        std::string currentCommand;
-        {
-            std::lock_guard<std::mutex> lock(commandMutex);
-            currentCommand = command;
+    outFile1 << "NDOB參數L: ";
+    for (double param : L) {
+        outFile1 << param << " ";
+    }
+    outFile1 << "\n";
+
+    outFile1 << "PID參數: ";
+    for (double param : PID) {
+        outFile1 << param << " ";
+    }
+    outFile1 << "\n";
+
+    outFile1 << "------------------------------------------------------------";
+    outFile1 << "\n";
+
+    outFile1.flush();
+
+    // log 緩衝
+    std::stringstream buffer_outFile1, buffer_outFile2;
+    int buffer_flush_counter = 0;
+    const int buffer_flush_frequency = 10;
+
+    // 姿態命令（固定水平 + 固定初始 yaw）
+    double psi_command_initial = 0.0;
+    double theta_command = 0.0, phi_command = 0.0, psi_command = 0.0;
+
+    // 控制輸出 / 擾動
+    double U1 = 0.0, U2 = 0.0, U3 = 0.0, U4 = 0.0, omega = 0.0;
+    double d_x = 0.0, z_x = 0.0, z_x_new = 0.0;
+    double d_y = 0.0, z_y = 0.0, z_y_new = 0.0;
+    double d_z = 0.0, z_z = 0.0, z_z_new = 0.0;
+    double d_phi = 0.0, z_phi = 0.0, z_phi_new = 0.0;
+    double d_theta = 0.0, z_theta = 0.0, z_theta_new = 0.0;
+    double d_psi = 0.0, z_psi = 0.0, z_psi_new = 0.0;
+
+    double max_force = 9.0, min_force = 2.5;
+    double max_sign = 800.0, min_sign = 600.0;
+    int index_position = 1, index_attitude = 1;
+
+    // IMU 偵測
+    double last_checked_imu_timestamp = 0.0;
+    int imu_loss_counter = 0;
+    const int imu_loss_threshold = 10;
+    std::deque<double> imu_intervals;
+    const size_t max_intervals = 10;
+
+    // SUBS相關參數
+    float xy_bound = 0.5; //m
+    float z_bound = 0.2; //m
+
+
+    while (ch_norm[4].load() >= -0.8f && running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // 可選：每隔一段時間打印當前值
+        static int wait_counter = 0;
+        wait_counter++;
+        if (wait_counter % 10 == 0) {  // 每秒打印一次
+            std::cout << "請將撥桿向下撥,當前通道值: "<< ch_norm[4].load() << std::endl;
         }
-                    if (currentCommand == "v1") {
-                std::cout << "v1go "  << std::endl;
-                sleep(1);
-
-                if (node->new_imu_data_available()) {
-                    auto imu_data = node->get_last_imu_data();
-
-                std::cout << "IMU Data: " << std::endl;
-                std::cout << "Orientation - x: " << imu_data.orientation.x << ", y: " << imu_data.orientation.y
-                          << ", z: " << imu_data.orientation.z << ", w: " << imu_data.orientation.w << std::endl;
-                std::cout << "Angular Velocity - x: " << imu_data.angular_velocity.x << ", y: " << imu_data.angular_velocity.y
-                          << ", z: " << imu_data.angular_velocity.z << std::endl;
-                std::cout << "Linear Acceleration - x: " << imu_data.linear_acceleration.x << ", y: " << imu_data.linear_acceleration.y
-                          << ", z: " << imu_data.linear_acceleration.z << std::endl;
-                float qx = imu_data.orientation.x;
-                float qy = imu_data.orientation.y;
-                float qz = imu_data.orientation.z;
-                float qw = imu_data.orientation.w;
-                float roll;float pitch; float yaw;
-
-                quaternionToEuler(qx, qy, qz, qw, roll, pitch, yaw);
-
-                std::cout << "Roll: " << roll*180/3.14 << ", Pitch: " << pitch*180/3.14 << ", Yaw: " << yaw*180/3.14<< std::endl;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-            }
-
-
-            
-            
-            else if (currentCommand == "v4") {
-                
-                
-
-                std::lock_guard<std::mutex> lock(commandMutex);
-
-          
-                if (node->new_imu_data_available()) {
-
-                auto start_time = std::chrono::steady_clock::now(); // 開始時間
-                i++;
-                auto imu_data = node->get_last_imu_data();
-                float qx = imu_data.orientation.x;
-                float qy = imu_data.orientation.y;
-                float qz = imu_data.orientation.z;
-                float qw = imu_data.orientation.w;
-                float roll;float pitch; float yaw;
-
-                quaternionToEuler(qx, qy, qz, qw, roll, pitch, yaw);
-                double phi=roll;
-                double theta=pitch;
-                double psi=yaw;
-
-                theta_command=0.0;
-                phi_command=0.0;
-                psi_command=psi_command_initial;
-                U1=23;
-                // std::cout << "v4go  "  << std::endl;
-
-                phi_command_Derivative.updateDt(attuide_dt);
-                theta_command_Derivative.updateDt(attuide_dt);
-                psi_command_Derivative.updateDt(attuide_dt);
-                phi_command_sec_Derivative.updateDt(attuide_dt);
-                theta_command_sec_Derivative.updateDt(attuide_dt);
-                psi_command_sec_Derivative.updateDt(attuide_dt);
-                
-
-
-                double phi_command_Dot = phi_command_Derivative.compute(phi_command);
-                double theta_command_Dot = theta_command_Derivative.compute(theta_command);
-                double psi_command_Dot = psi_command_Derivative.compute(psi_command);
-                
-                if (phi_command_Dot> attitude_command_bound_derivative) {
-                        phi_command_Dot = attitude_command_bound_derivative;
-                } else if ( phi_command_Dot < -attitude_command_bound_derivative) {
-                        phi_command_Dot = -attitude_command_bound_derivative;
-                    }
-                
-                if (theta_command_Dot> attitude_command_bound_derivative) {
-                        theta_command_Dot = attitude_command_bound_derivative;
-                } else if ( theta_command_Dot < -attitude_command_bound_derivative) {
-                       theta_command_Dot = -attitude_command_bound_derivative;
-                    }
-                
-                if ( psi_command_Dot> attitude_command_bound_derivative) {
-                        psi_command_Dot = attitude_command_bound_derivative;
-                } else if ( psi_command_Dot < -attitude_command_bound_derivative) {
-                        psi_command_Dot = -attitude_command_bound_derivative;
-                    }
-
-                double phi_command_sec_Dot = phi_command_sec_Derivative.compute(phi_command_Dot);
-                double theta_command_sec_Dot = theta_command_sec_Derivative.compute(theta_command_Dot);
-                double psi_command_sec_Dot = psi_command_sec_Derivative.compute(psi_command_Dot);
-
-                 if (phi_command_sec_Dot> attitude_command_bound_sec_derivative) {
-                        phi_command_sec_Dot = attitude_command_bound_sec_derivative;
-                } else if ( phi_command_sec_Dot < -attitude_command_bound_sec_derivative) {
-                        phi_command_sec_Dot = -attitude_command_bound_sec_derivative;
-                    }
-                
-                if (theta_command_sec_Dot> attitude_command_bound_sec_derivative) {
-                        theta_command_sec_Dot = attitude_command_bound_sec_derivative;
-                } else if ( theta_command_sec_Dot < -attitude_command_bound_sec_derivative) {
-                       theta_command_sec_Dot = -attitude_command_bound_sec_derivative;
-                    }
-                
-                if ( psi_command_sec_Dot> attitude_command_bound_sec_derivative) {
-                        psi_command_sec_Dot = attitude_command_bound_sec_derivative;
-                } else if ( psi_command_sec_Dot< -attitude_command_bound_sec_derivative) {
-                        psi_command_sec_Dot = -attitude_command_bound_sec_derivative;
-                    }
-
-
-
-
-                double phi_Dot=imu_data.angular_velocity.x;
-                double theta_Dot=-imu_data.angular_velocity.y;
-                double psi_Dot=-imu_data.angular_velocity.z;
-
-
-
-                double phi_e=phi-phi_command;
-                double theta_e=theta-theta_command;
-                double psi_e=psi-psi_command;
-                
-
-
-                double phi_e_Dot=phi_Dot-phi_command_Dot;
-                double theta_e_Dot=theta_Dot-theta_command_Dot;
-                double psi_e_Dot=psi_Dot-psi_command_Dot;
-
-                double sphi=C[3]*phi_e+phi_e_Dot;
-                double stheta=C[4]*theta_e+theta_e_Dot;
-                double spsi=C[5]*psi_e+psi_e_Dot;
-                
-                double sphi_sat;
-                if (std::abs(sphi) > bound) {
-                    sphi_sat = (sphi > 0) ? 1 : -1;
-                } else {
-                    sphi_sat = sphi / bound;
-                }
-                 
-                double stheta_sat;
-                if (std::abs(stheta) > bound) {
-                    stheta_sat = (stheta > 0) ? 1 : -1;
-                } else {
-                    stheta_sat = stheta / bound;
-                }
-                
-                double spsi_sat;
-                if (std::abs(spsi) > bound) {
-                    spsi_sat = (spsi > 0) ? 1 : -1;
-                } else {
-                    spsi_sat = spsi / bound;
-                }
-
-                //d_phi=0;d_theta=0;d_psi=0;
-
-                double uphi=((-(Iyy-Izz)/Ixx)*theta_Dot*psi_Dot-C[3]*phi_e_Dot-K[3]*sphi-Eta[3]*sphi_sat+((Jtp/Ixx)*theta_Dot*omega)+phi_command_sec_Dot)-d_phi;
-                double utheta=((-(Izz-Ixx)/Iyy)*phi_Dot*psi_Dot-C[4]*theta_e_Dot-K[4]*stheta-Eta[4]*stheta_sat-((Jtp/Iyy)*phi_Dot*omega)+theta_command_sec_Dot)-d_theta;
-                double upsi=((-(Ixx-Iyy)/Izz)*phi_Dot*theta_Dot-C[5]*psi_e_Dot-K[5]*spsi-Eta[5]*spsi_sat+psi_command_sec_Dot)-d_psi;
-                double U2=uphi*Ixx;
-                double U3=utheta*Iyy;
-                double U4=upsi*Izz;
-                
-                // double uphi=((-(Iyy-Izz)/Ixx)*theta_Dot*psi_Dot-C[3]*phi_e_Dot-K[3]*sphi-Eta[3]*sphi_sat+((Jtp/Ixx)*theta_Dot*omega)+phi_command_sec_Dot);
-                // double utheta=((-(Izz-Ixx)/Iyy)*phi_Dot*psi_Dot-C[4]*theta_e_Dot-K[4]*stheta-Eta[4]*stheta_sat-((Jtp/Iyy)*phi_Dot*omega)+theta_command_sec_Dot);
-                // double upsi=((-(Ixx-Iyy)/Izz)*phi_Dot*theta_Dot-C[5]*psi_e_Dot-K[5]*spsi-Eta[5]*spsi_sat+psi_command_sec_Dot);
-                // double U2=uphi*Ixx;
-                // double U3=utheta*Iyy;
-                // double U4=upsi*Izz;
-                
-                
-    
-               
-
-                // std::cout << "phi is " <<phi<< std::endl;
-                // std::cout << "theta is " <<theta<< std::endl;
-                // std::cout << "psi is " <<psi<< std::endl;
-                // std::cout << "sphi is " <<sphi<< std::endl;
-                // std::cout << "stheta is " <<stheta<< std::endl;
-                // std::cout << "spsi is " <<spsi<< std::endl;
-                // std::cout << "phi_Dot is " <<phi_Dot<< std::endl;
-                // std::cout << "theta_Dot is " <<theta_Dot<< std::endl;
-                // std::cout << "psi_Dot is " <<psi_Dot<< std::endl;
-                // std::cout << "phi_e_Dot is " <<phi_e_Dot<< std::endl;
-                // std::cout << "theta_e_Dot is " <<theta_e_Dot<< std::endl;
-                // std::cout << "psi_e_Dot is " <<psi_e_Dot<< std::endl;
-                // std::cout << "phi_command_sec_Dot is " <<phi_command_sec_Dot<< std::endl;
-                // std::cout << "theta_command_sec_Dot is " <<theta_command_sec_Dot<< std::endl;
-                // std::cout << "psi_command_sec_Dot is " <<psi_command_sec_Dot<< std::endl;
-                // std::cout << "U2 is" <<U2<< std::endl;
-                // std::cout << "U3 is" <<U3<< std::endl;
-                // std::cout << "U4 is" <<U4<< std::endl;
-
-
-                
-
-
-
-
-                double vector[4] = {U1, U2, U3, U4};
-                double result[4] = {0.0, 0.0, 0.0, 0.0};
-
-                double matrix[4][4] = {
-                {0.25, 1.866, -1.866, -14.286},
-                {0.25, 1.866, 1.866, 14.286},
-                {0.25, -1.866, 1.866, -14.286},
-                {0.25, -1.866, -1.866, 14.286}
-                };
-
-                for(int i = 0; i < 4; i++) {
-                    for(int j = 0; j < 4; j++) {
-                        result[i] += matrix[i][j] * vector[j];
-                            }
-                        }
-                double force_1=result[0];
-                double force_2=result[1];
-                double force_3=result[2];
-                double force_4=result[3];
-                
-                if ( force_1> max_force) {
-                   force_1 =  max_force;
-                } else if (force_1<min_force) {
-                    force_1=min_force;
-                    }
-                 if ( force_2> max_force) {
-                   force_2 = max_force;
-                } else if (force_2< min_force) {
-                    force_2= min_force;
-                    }
-                 if ( force_3>  max_force) {
-                   force_3 =  max_force;
-                } else if (force_3<min_force) {
-                    force_3= min_force;
-                    }
-                  if ( force_4>  max_force) {
-                   force_4 =  max_force;
-                } else if (force_4< min_force) {
-                    force_4= min_force;
-                    }
-                
-
-
-
-
-
-
-
-
-
-                double rotor_sign_1=interpolate(force_1, rotorforce_change);
-                double rotor_sign_2=interpolate(force_2, rotorforce_change);
-                double rotor_sign_3=interpolate(force_3, rotorforce_change);
-                double rotor_sign_4=interpolate(force_4, rotorforce_change);
-
-
-                
-
-                if ( rotor_sign_1> max_sign) {
-                   rotor_sign_1 = max_sign;
-                } else if ( rotor_sign_1< min_sign) {
-                    rotor_sign_1= min_sign;
-                    }
-                
-                if (rotor_sign_2> max_sign) {
-                    rotor_sign_2= max_sign;
-                } else if ( rotor_sign_2< min_sign) {
-                    rotor_sign_2 = min_sign;
-                    }
-
-                 if ( rotor_sign_3 >max_sign) {
-                    rotor_sign_3= max_sign;
-                } else if ( rotor_sign_3< min_sign) {
-                   rotor_sign_3= min_sign;
-                    }
-
-                if (rotor_sign_4> max_sign) {
-                    rotor_sign_4 = max_sign;
-                } else if (rotor_sign_4< min_sign) {
-                   rotor_sign_4 = min_sign;
-                    }
-
-
-
-
-
-                double rotor_speed_1=interpolate(rotor_sign_1,rotorspeed_change);
-                double rotor_speed_2=interpolate(rotor_sign_2,rotorspeed_change);
-                double rotor_speed_3=interpolate(rotor_sign_3,rotorspeed_change);
-                double rotor_speed_4=interpolate(rotor_sign_4,rotorspeed_change);
-
-
-
-
-                omega=-rotor_speed_1+rotor_speed_2-rotor_speed_3+rotor_speed_4;
-
-
-
-
-                int pwm_sign_motor1=std::round(rotor_sign_1);
-                int pwm_sign_motor2=std::round(rotor_sign_2);
-                int pwm_sign_motor3=std::round(rotor_sign_3);
-                int pwm_sign_motor4=std::round(rotor_sign_4);
-
-                
-                ndob_phi(phi_Dot,theta_Dot,psi_Dot,attuide_dt,uphi,omega,z_phi,d_phi,z_phi_new);
-                ndob_theta(phi_Dot,theta_Dot,psi_Dot,attuide_dt,utheta,omega,z_theta,d_theta,z_theta_new);
-                ndob_psi(phi_Dot,theta_Dot,psi_Dot,attuide_dt,upsi,omega,z_psi,d_psi,z_psi_new);
-                z_phi=z_phi_new;
-                z_theta=z_theta_new;
-                z_psi=z_psi_new;
-
-                //Eta = {0.1, 0.1, 0.1, (0.1+std::abs(d_phi)), (0.1+std::abs(d_theta)), (0.1+std::abs(d_psi))};
-                // std::cout << "z_phi is " <<z_phi<< std::endl;
-                // std::cout << "d_phi" <<d_phi<< std::endl;
-
-
-
-                
-                setPWM(file, 1, 0, pwm_sign_motor1); 
-                setPWM(file, 2, 0, pwm_sign_motor2); 
-                setPWM(file, 3, 0, pwm_sign_motor3); 
-                setPWM(file, 4, 0, pwm_sign_motor4);
-            
-
-                auto end_time = std::chrono::steady_clock::now(); // 結束時間
-
-                double response_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                                    end_time - start_time).count() / 1000.0; // 單位：毫秒
-                std::cout << "Response time: " << response_time << " ms" << std::endl;
-
-
-                VariablesGroup group1 = {{sphi,stheta,sphi}};
-                VariablesGroup group2 = {{d_phi,d_theta,d_psi}};
-                VariablesGroup group3 = {{sphi,index1}};
-                VariablesGroup group4 = {{phi_Dot,theta_Dot,psi_Dot}};
-                VariablesGroup group12 = {{phi_e*180/M_PI}};
-                VariablesGroup group13 = {{theta_e*180/M_PI}};
-                VariablesGroup group14 = {{psi_e*180/M_PI}};
-                VariablesGroup group15 = {{pwm_sign_motor1,pwm_sign_motor2,pwm_sign_motor3,pwm_sign_motor4}};
-                VariablesGroup group16 = {{phi*180/M_PI,theta*180/M_PI,psi*180/M_PI}};
-                VariablesGroup group17 = {{U1,U2,U3,U4}};
-                
-
-
-                for (const auto& var : group1.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-                for (const auto& var : group2.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-                
-  
-                for (const auto& var : group3.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-                
-
-                for (const auto& var : group4.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-                for (const auto& var : group12.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-                for (const auto& var : group13.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-      
-                for (const auto& var : group14.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-
-                for (const auto& var : group15.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-
-
-                for (const auto& var : group16.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-                for (const auto& var : group17.group) {
-                    outFile2 << var << " ";
-                }
-                outFile2 << std::endl;
-
-
-                index1++;		
-		    }
-            }
+    }
+
+    // 初始化 psi_command
+    float initial_roll, initial_pitch, initial_yaw;
+    psi_command = 0.0;
+    for (int i = 0; i < 100; i++) {
+        while (!node->new_imu_data_available()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        auto initial_imu_data = node->get_last_imu_data();
+        quaternionToEuler(initial_imu_data.orientation.x, initial_imu_data.orientation.y,
+                          initial_imu_data.orientation.z, initial_imu_data.orientation.w,
+                          initial_roll, initial_pitch, initial_yaw);
+        psi_command += initial_yaw;
+    }
+    psi_command_initial = psi_command / 100.0;
+
+    // 等待第一筆 GPS
+    while (node->get_last_gps_timestamp() == 0.0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    last_gps_timestamp_seen = node->get_last_gps_timestamp();
+    last_gps_wallclock     = std::chrono::high_resolution_clock::now();
+
+    std::cout << "Init successful. psi_command_initial = "<< psi_command_initial*180/M_PI <<"\n";
+    if (psi_command_initial*180/M_PI < -150 || psi_command_initial*180/M_PI > 150) {
+        std::cout << "⚠️Warning: psi_command_initial is approaching ±180 degrees.\n";
+    }
+    auto writeGroup = [](std::stringstream& buffer, const VariablesGroup& group) {
+        for (const auto& name : group.names) buffer << name << " ";
+        for (const auto& var : group.group) buffer << var << " ";
+        buffer << "\n";
+    };
+
+    // === 新增：GPS fallback 狀態 ===
+    bool gps_fallback_active = false;
+
+    while (running) {
+        // === 固定主迴圈頻率為 100 Hz，並量測迴圈間隔 ===
+        static auto last_loop_time = std::chrono::steady_clock::now();
+        auto loop_start = std::chrono::steady_clock::now();
+
+        // 計算與上一圈的時間差（秒）
+        double loop_interval_sec =
+            std::chrono::duration_cast<std::chrono::duration<double>>(loop_start - last_loop_time).count();
+
+        // 每 50 圈印一次間隔時間（理論值應該接近 0.01 秒）
+        static int loop_counter = 0;
+        loop_counter++;
+        // if (loop_counter % 50 == 0) {
+        //    std::cout << "[Loop Interval] " << std::fixed << std::setprecision(6)
+        //              << loop_interval_sec << " sec" << std::endl;
+        // }
+        last_loop_time = loop_start;
+
+        auto now = std::chrono::high_resolution_clock::now();
+
+        // SUBS相關參數
+        static std::string last_mode = "off";  // 記錄上一次狀態，避免重複觸發
+        float x_in   = ch_norm[1];
+        float y_in  = ch_norm[0];
+        float z_in  = ch_norm[2];
+        float switching = ch_norm[4];
         
 
-            else if (currentCommand == "v6") {
-                std::cout << "v6go  "  << std::endl;
-                std::lock_guard<std::mutex> lock(commandMutex);
-                sleep(1);
-
-                setPWM(file, 0, 0, 600); 
-                setPWM(file, 1, 0, 600); 
-                setPWM(file, 2, 0, 600); 
+        if (switching >= -0.5f && switching <= -0.4f && last_mode != "motor_on") {
+            if (!motors_on) {
+                motors_on = true;
+                last_mode = "motor_on";
+                setPWM(file, 1, 0, 600);
+                setPWM(file, 2, 0, 600);
                 setPWM(file, 3, 0, 600);
-                setPWM(file, 4, 0, 600); 
-                
- 
-
-               
+                setPWM(file, 4, 0, 600);
+                std::cout << "Motors ON.\n";
             }
-
-                else if (currentCommand == "v7") {
-    
-                std::lock_guard<std::mutex> lock(commandMutex);
-                sleep(1);
-                setPWM(file, 0, 0, 400); 
-                setPWM(file, 1, 0, 400); 
-                setPWM(file, 2, 0, 400); 
-                setPWM(file, 3, 0, 400);
-                setPWM(file, 4, 0, 400); 
-                std::cout << " " <<i<< std::endl; 
-               
-            }
-
-
-            else {
-                std::cout << "not define command  " <<currentCommand << std::endl;
-                sleep(1); 
-               
-            }
-            if(!running)
-            {
-                break;
-            }
-        
-
-
-
-
-
         }
+        else if (switching >= -0.25f && switching <= -0.15f && last_mode != "control_mode") {
+            if (motors_on) {
+                control_mode_on = true;
+                psi_command = psi_command_initial;
+                last_mode = "control_mode";
+                std::cout << "🟢 Enter control mode" << std::endl;
+            } else {
+                std::cout << "⚠️ Cannot enter control mode — motors are OFF" << std::endl;
+            }
+        }
+        else if (switching > 0.0f && last_mode != "motor_off") {
+            motors_on = false;
+            control_mode_on = false;
+            last_mode = "motor_off";
+
+            setPWM(file, 1, 0, 400);
+            setPWM(file, 2, 0, 400);
+            setPWM(file, 3, 0, 400);
+            setPWM(file, 4, 0, 400);
+
+            std::cout << "🔴 Motors OFF" << std::endl;
+        }
+
+        // IMU 狀態監看
+        double current_imu_timestamp = node->get_last_imu_timestamp();
+        static auto start_time = program_start;
+        if (current_imu_timestamp > last_checked_imu_timestamp) {
+            double interval = current_imu_timestamp - last_checked_imu_timestamp;
+            last_checked_imu_timestamp = current_imu_timestamp;
+            imu_intervals.push_back(interval * 1000.0);
+            if (imu_intervals.size() > max_intervals) imu_intervals.pop_front();
+            imu_loss_counter = 0; imu_loss_detected = false;
+        }
+        auto elapsed_since_start = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
+        if (elapsed_since_start > imu_detection_delay) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - std::chrono::high_resolution_clock::time_point(
+                std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
+                std::chrono::duration<double>(current_imu_timestamp))));
+            if (elapsed > imu_timeout) {
+                imu_loss_counter++;
+                if (imu_loss_counter >= imu_loss_threshold) {
+                    std::cerr << "Warning: IMU data lost > " << imu_timeout.count()
+                              << "ms, counter=" << imu_loss_counter << "\n";
+                    std::cerr << "Recent IMU intervals (ms): ";
+                    for (const auto& itv : imu_intervals) std::cerr << itv << " ";
+                    std::cerr << "\n";
+                    imu_loss_detected = true;
+                }
+            }
+        }
+
+        // ====================== 位置回路（10 Hz, 只 z）======================
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_position_update) >= position_update_interval) {
+
+            // --- 檢查 GPS 是否有新資料，並以「最後看到新時間戳」+ timeout 判定可用性 ---
+            bool gps_ok_now = false;
+            double gps_ts = node->get_last_gps_timestamp();
+            if (gps_ts > last_gps_timestamp_seen) {
+                // 收到新 GPS
+                last_gps_timestamp_seen = gps_ts;
+                last_gps_wallclock = now;
+
+                auto gps_data = node->get_last_gps_data();
+                {
+                    std::lock_guard<std::mutex> lock(dataMutex);
+                    current_x = gps_data.pose.pose.position.x;
+                    current_y = gps_data.pose.pose.position.y;
+                    current_z = gps_data.pose.pose.position.z;
+                }
+                gps_ok_now = true;
+            } else {
+                // 沒有新資料 → 看 timeout
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_gps_wallclock);
+                gps_ok_now = (elapsed <= gps_timeout);
+            }
+
+            // 若有用到 XY 超界（保護）
+            if (gps_ok_now) {
+                double x, y;
+                { std::lock_guard<std::mutex> lock(dataMutex); x = current_x; y = current_y; }
+                double dist_xy = std::hypot(x, y);
+                xy_exceeded = (dist_xy > XY_RADIUS_LIMIT);
+                z_exceeded = (std::fabs(current_z) > Z_RADIUS_LIMIT);
+            }
+
+            // --- 依狀態切換 GPS fallback ---
+            if (control_mode_on) {
+                if (!gps_ok_now && !gps_fallback_active) {
+                    // 進入 fallback
+                    gps_fallback_active = true;
+                    std::cout << "GPS LOST → Fallback: set U1=17.65N, keep level, z_target unchanged.\n";
+                } else if (gps_ok_now && gps_fallback_active) {
+                    // 離開 fallback，恢復 Z 控制器
+                    gps_fallback_active = false;
+                    // 以「當前高度」為新起點
+                    double cz;
+                    { std::lock_guard<std::mutex> lock(dataMutex); cz = current_z; }
+                    z_command = cz;
+                }
+            } else {
+                // 非控制模式 → 確保 fallback 關閉
+                gps_fallback_active = false;
+            }
+
+            // --- 只有 GPS 正常且在控制模式才更新 Z 控制器 ---
+            if (gps_ok_now && control_mode_on) {
+                auto imu_data = node->get_last_imu_data();
+                float phi, theta, psi;
+                quaternionToEuler(imu_data.orientation.x, imu_data.orientation.y, imu_data.orientation.z, imu_data.orientation.w, phi, theta, psi);
+
+                // 用 GPS header timestamp 估 dt（與舊版一致）
+                auto gps_data = node->get_last_gps_data();
+                double current_time = gps_data.header.stamp.sec + gps_data.header.stamp.nanosec * 1e-9;
+                double dt_position = (last_position_time == 0.0) ? 0.1 : (current_time - last_position_time);
+                last_position_time = current_time;
+                if (dt_position <= 0) dt_position = 0.1;
+                else if (dt_position > 0.2) dt_position = 0.2;
+
+                float x_in = ch_norm[1].load();
+                float y_in = ch_norm[0].load();
+                float z_in = ch_norm[2].load();
+
+                x_command = x_in * xy_bound;
+                y_command = y_in * xy_bound;
+                z_command = 0.2 + z_in * z_bound;
+
+                // -------- z 命令導數與夾限 --------
+                z_command_Derivative.updateDt(dt_position);
+                z_command_sec_Derivative.updateDt(dt_position);
+
+                double x_command_Dot = x_command_Derivative.update(x_command);
+                double y_command_Dot = y_command_Derivative.update(y_command);
+                double z_command_Dot = z_command_Derivative.update(z_command);
+                if (x_command_Dot > position_command_bound_derivative) x_command_Dot = position_command_bound_derivative;
+                else if (x_command_Dot < -position_command_bound_derivative) x_command_Dot = -position_command_bound_derivative;
+                if (y_command_Dot > position_command_bound_derivative) y_command_Dot = position_command_bound_derivative;
+                else if (y_command_Dot < -position_command_bound_derivative) y_command_Dot = -position_command_bound_derivative;
+                if (z_command_Dot > position_command_bound_derivative) z_command_Dot = position_command_bound_derivative;
+                else if (z_command_Dot < -position_command_bound_derivative) z_command_Dot = -position_command_bound_derivative;
+
+                double x_command_sec_Dot = x_command_sec_Derivative.update(x_command_Dot);
+                double y_command_sec_Dot = y_command_sec_Derivative.update(y_command_Dot);
+                double z_command_sec_Dot = z_command_sec_Derivative.update(z_command_Dot);
+                if (x_command_sec_Dot > position_command_bound_sec_derivative) x_command_sec_Dot = position_command_bound_sec_derivative;
+                else if (x_command_sec_Dot < -position_command_bound_sec_derivative) x_command_sec_Dot = -position_command_bound_sec_derivative;
+                if (y_command_sec_Dot > position_command_bound_sec_derivative) y_command_sec_Dot = position_command_bound_sec_derivative;
+                else if (y_command_sec_Dot < -position_command_bound_sec_derivative) y_command_sec_Dot = -position_command_bound_sec_derivative;
+                if (z_command_sec_Dot > position_command_bound_sec_derivative) z_command_sec_Dot = position_command_bound_sec_derivative;
+                else if (z_command_sec_Dot < -position_command_bound_sec_derivative) z_command_sec_Dot = -position_command_bound_sec_derivative;
+
+                // 目前速度（與你原本重映射一致）
+                double current_x_Dot = gps_data.twist.twist.linear.x;
+                double current_y_Dot = gps_data.twist.twist.linear.y;
+                double current_z_Dot = gps_data.twist.twist.linear.z;
+                z_vel_exceeded = (std::fabs(current_z_Dot) > Z_VELOCITY_LIMIT);
+
+
+                // 誤差與滑模面（僅 z）
+                double x_e = current_x - x_command;
+                double y_e = current_y - y_command;
+                double z_e = current_z - z_command;
+
+                double x_e_Dot = current_x_Dot - x_command_Dot;
+                double y_e_Dot = current_y_Dot - y_command_Dot;
+                double z_e_Dot = current_z_Dot - z_command_Dot;
+
+                // 滑模面
+                double sx = C[0] * x_e + x_e_Dot;
+                double sy = C[1] * y_e + y_e_Dot;
+                double sz = C[2] * z_e + z_e_Dot;
+
+                double sx_sat = (std::abs(sx) > bound) ? (sx > 0 ? 1 : -1) : sx / bound;
+                double sy_sat = (std::abs(sy) > bound) ? (sy > 0 ? 1 : -1) : sy / bound;
+                double sz_sat = (std::abs(sz) > bound) ? (sz > 0 ? 1 : -1) : sz / bound;
+
+                // NDOB（用上一次 U1）
+                ndob_x(current_x_Dot, phi, theta, psi, dt_position, U1, z_x, d_x, z_x_new, L[0]);
+                ndob_y(current_y_Dot, phi, theta, psi, dt_position, U1, z_y, d_y, z_y_new, L[1]);
+                ndob_z(current_z_Dot, phi, theta, dt_position, U1, z_z, d_z, z_z_new, L[2]);
+                z_x = z_x_new; z_y = z_y_new; z_z = z_z_new;
+
+                // 控制律
+                double ux = -C[0] * x_e_Dot + Cv * (current_x_Dot / m) + x_command_sec_Dot - K[0] * sx - Eta[0] * sx_sat - d_x;
+                double uy = -C[1] * y_e_Dot + Cv * (current_y_Dot / m) + y_command_sec_Dot - K[1] * sy - Eta[1] * sy_sat - d_y;
+                double uz = -C[2] * z_e_Dot + Cv * (current_z_Dot / m) + z_command_sec_Dot - K[2] * sz - Eta[2] * sz_sat + g - d_z;
+
+
+                //高度PID控制///////////////////////////////////////////////////////////////
+
+                // // 外圈P控制：計算位置誤差，並根據誤差計算期望的速度
+                // double vz = - PID[0]* z_e; // 位置控制誤差 -> 目標速度
+                // if (std::fabs(z_e) < 0.05) vz = 0;
+
+                // // 內圈PID控制：計算速度誤差，並根據誤差調整推力
+                // double vz_e = vz - current_z_Dot; // 計算速度誤差
+
+                // I_vz_e += vz_e * dt_position;     // 累積誤差（積分項）
+                // // 積分項飽和處理，防止積分風暴
+                // if (I_vz_e > PID[4]) I_vz_e = PID[4];
+                // else if (I_vz_e < PID[5]) I_vz_e = PID[5];
+
+                // // 使用 FOHPDerivative 計算微分項
+                // double D_vz_e = vz_e_derivative.update(vz_e);  // 使用 FOHPDerivative 計算微分項
+
+                // // 計算推力（Uz），加入重力補償
+                // double uz = g + (PID[1] * vz_e) + (PID[2] * I_vz_e) + (PID[3] * D_vz_e);
+
+                //高度PID控制///////////////////////////////////////////////////////////////
+                
+
+                if (std::abs(uz) < 1e-6) uz = 1e-6;
+
+                // 由 ux/uy/uz 轉姿態命令
+                phi_command = atan2(- uy , uz);
+                theta_command = atan2(ux , uz); // 無人機頭朝正北的假設下的簡化
+
+                stored_uz = uz;
+
+                // ====== 位置記錄（僅 z） ======
+                VariablesGroup g1 = {{"index : "}, {static_cast<double>(index_position)}};
+                VariablesGroup g2 = {{"current position : "}, {current_x, current_y, current_z}};
+                VariablesGroup g3 = {{"current velocity : "}, {current_x_Dot, current_y_Dot, current_z_Dot}};
+                VariablesGroup g4 = {{"position command : "}, {x_command, y_command, z_command}};
+                VariablesGroup g5 = {{"command_Dot : "}, {x_command_Dot, y_command_Dot, z_command_Dot}};
+                VariablesGroup g6 = {{"command_sec_Dot : "}, {x_command_sec_Dot, y_command_sec_Dot, z_command_sec_Dot}};
+                VariablesGroup g7 = {{"error : "}, {x_e, y_e, z_e}};
+                VariablesGroup g8 = {{"sliding surface : "}, {sx, sy, sz}};
+                VariablesGroup g9 = {{"ux uy uz : "}, {ux, uy, uz}};
+                VariablesGroup g10= {{"target : "}, {x_target, y_target, z_target}};
+                VariablesGroup g11= {{"attitude cmd(deg) : "}, {phi_command * 180.0 / M_PI, theta_command * 180.0 / M_PI, psi_command * 180.0 / M_PI}};
+                //VariablesGroup g12={{"目標速度、目標速度誤差、累積誤差、微分誤差"}, {vz, vz_e, I_vz_e, D_vz_e}};
+                VariablesGroup g13= {{"------------------------------------------------------------"}, {}};
+
+                writeGroup(buffer_outFile1, g1);
+                writeGroup(buffer_outFile1, g2);
+                writeGroup(buffer_outFile1, g3);
+                writeGroup(buffer_outFile1, g4);
+                writeGroup(buffer_outFile1, g5);
+                writeGroup(buffer_outFile1, g6);
+                writeGroup(buffer_outFile1, g7);
+                writeGroup(buffer_outFile1, g8);
+                writeGroup(buffer_outFile1, g9);
+                writeGroup(buffer_outFile1, g10);
+                writeGroup(buffer_outFile1, g11);
+                //writeGroup(buffer_outFile1, g12);
+                writeGroup(buffer_outFile1, g13);
+
+
+                index_position++;
+            }
+
+            last_position_update = now;
+        }
+
+        // ====================== 姿態回路（100 Hz）======================
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_attitude_update) >= attitude_update_interval) {
+            auto imu_data = node->get_last_imu_data();
+            auto elapsed_imu = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - std::chrono::high_resolution_clock::time_point(
+                    std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
+                        std::chrono::duration<double>(node->get_last_imu_timestamp()))));
+
+            if (elapsed_imu <= imu_timeout) {
+                double current_time = imu_data.header.stamp.sec + imu_data.header.stamp.nanosec * 1e-9;
+                double dt_attitude = (last_attitude_time == 0.0) ? 0.01 : (current_time - last_attitude_time);
+                last_attitude_time = current_time;
+                if (dt_attitude <= 0) dt_attitude = 0.01;
+                else if (dt_attitude > 0.05) dt_attitude = 0.05;
+
+                float phi = 0.0f, theta = 0.0f, psi = 0.0f;
+                quaternionToEuler(imu_data.orientation.x, imu_data.orientation.y, imu_data.orientation.z, imu_data.orientation.w, phi, theta, psi);
+                roll = phi; pitch = theta; yaw = psi;
+
+                {
+                    std::lock_guard<std::mutex> lock(dataMutex);
+                    bool att_invalid = (std::abs(roll) > max_angle || std::abs(pitch) > max_angle);
+                    if (att_invalid) {
+                        std::cerr << "Warning: Attitude invalid, roll=" << roll * 180.0 / M_PI
+                                  << " deg, pitch=" << pitch * 180.0 / M_PI << " deg\n";
+                    }
+                    attitude_invalid = att_invalid;
+                }
+
+                if (control_mode_on) {
+                    // 命令導數（姿態）
+                    phi_command_Derivative.updateDt(dt_attitude);
+                    theta_command_Derivative.updateDt(dt_attitude);
+                    psi_command_Derivative.updateDt(dt_attitude);
+                    phi_command_sec_Derivative.updateDt(dt_attitude);
+                    theta_command_sec_Derivative.updateDt(dt_attitude);
+                    psi_command_sec_Derivative.updateDt(dt_attitude);
+
+                    double phi_command_Dot = phi_command_Derivative.update(phi_command);
+                    double theta_command_Dot = theta_command_Derivative.update(theta_command);
+                    double psi_command_Dot = psi_command_Derivative.update(psi_command);
+
+                    if (phi_command_Dot > attitude_command_bound_derivative) phi_command_Dot = attitude_command_bound_derivative;
+                    else if (phi_command_Dot < -attitude_command_bound_derivative) phi_command_Dot = -attitude_command_bound_derivative;
+                    if (theta_command_Dot > attitude_command_bound_derivative) theta_command_Dot = attitude_command_bound_derivative;
+                    else if (theta_command_Dot < -attitude_command_bound_derivative) theta_command_Dot = -attitude_command_bound_derivative;
+                    if (psi_command_Dot > attitude_command_bound_derivative) psi_command_Dot = attitude_command_bound_derivative;
+                    else if (psi_command_Dot < -attitude_command_bound_derivative) psi_command_Dot = -attitude_command_bound_derivative;
+
+                    double phi_command_sec_Dot   = phi_command_sec_Derivative.update(phi_command_Dot);
+                    double theta_command_sec_Dot = theta_command_sec_Derivative.update(theta_command_Dot);
+                    double psi_command_sec_Dot   = psi_command_sec_Derivative.update(psi_command_Dot);
+
+                    if (phi_command_sec_Dot > attitude_command_bound_sec_derivative) phi_command_sec_Dot = attitude_command_bound_sec_derivative;
+                    else if (phi_command_sec_Dot < -attitude_command_bound_sec_derivative) phi_command_sec_Dot = -attitude_command_bound_sec_derivative;
+                    if (theta_command_sec_Dot > attitude_command_bound_sec_derivative) theta_command_sec_Dot = attitude_command_bound_sec_derivative;
+                    else if (theta_command_sec_Dot < -attitude_command_bound_sec_derivative) theta_command_sec_Dot = -attitude_command_bound_sec_derivative;
+                    if (psi_command_sec_Dot > attitude_command_bound_sec_derivative) psi_command_sec_Dot = attitude_command_bound_sec_derivative;
+                    else if (psi_command_sec_Dot < -attitude_command_bound_sec_derivative) psi_command_sec_Dot = -attitude_command_bound_sec_derivative;
+
+                    // IMU 角速度（與你原本重映射一致）
+                    double phi_Dot   = imu_data.angular_velocity.x;
+                    double theta_Dot = -imu_data.angular_velocity.y;
+                    double psi_Dot   = -imu_data.angular_velocity.z;
+
+                    // 姿態誤差與滑模面
+                    double phi_e   = phi - phi_command;
+                    double theta_e = theta - theta_command;
+                    double psi_e   = psi - psi_command;
+
+                    double phi_e_Dot   = phi_Dot   - phi_command_Dot;
+                    double theta_e_Dot = theta_Dot - theta_command_Dot;
+                    double psi_e_Dot   = psi_Dot   - psi_command_Dot;
+
+                    double sphi   = C[3] * phi_e   + phi_e_Dot;
+                    double stheta = C[4] * theta_e + theta_e_Dot;
+                    double spsi   = C[5] * psi_e   + psi_e_Dot;
+
+                    double sphi_sat   = (std::abs(sphi) > bound)   ? (sphi > 0 ? 1 : -1)   : sphi / bound;
+                    double stheta_sat = (std::abs(stheta) > bound) ? (stheta > 0 ? 1 : -1) : stheta / bound;
+                    double spsi_sat   = (std::abs(spsi) > bound)   ? (spsi > 0 ? 1 : -1)   : spsi / bound;
+
+                    // 姿態控制律
+                    double uphi   = ((-(Iyy - Izz) / Ixx) * theta_Dot * psi_Dot - C[3] * phi_e_Dot - K[3] * sphi - Eta[3] * sphi_sat
+                                    + (Jtp / Ixx) * theta_Dot * omega + phi_command_sec_Dot) - d_phi;
+                    double utheta = ((-(Izz - Ixx) / Iyy) * phi_Dot   * psi_Dot - C[4] * theta_e_Dot - K[4] * stheta - Eta[4] * stheta_sat
+                                    - (Jtp / Iyy) * phi_Dot   * omega + theta_command_sec_Dot) - d_theta;
+                    double upsi   = ((-(Ixx - Iyy) / Izz) * phi_Dot   * theta_Dot - C[5] * psi_e_Dot - K[5] * spsi - Eta[5] * spsi_sat
+                                    + psi_command_sec_Dot) - d_psi;
+
+                    // 推力與力矩
+                    double cos_product = cos(phi) * cos(theta);
+                    if (std::abs(cos_product) < 1e-6) cos_product = (cos_product >= 0) ? 1e-6 : -1e-6;
+
+                    // === 關鍵：U1 在 GPS fallback 下改為 17.65 N，否則用 z 控制器的 stored_uz ===
+                    if (gps_fallback_active) {
+                        U1 = WEIGHT_FORCE;                 // 直接給總推力
+                        // 同時維持水平命令
+                        theta_command = 0.0;
+                        phi_command   = 0.0;
+                        psi_command   = psi_command_initial;
+                    } else {
+                        U1 = (stored_uz * m) / cos_product; // 正常情況
+                    }
+
+                    U2 = uphi   * Ixx;
+                    U3 = utheta * Iyy;
+                    U4 = upsi   * Izz;
+
+                    // 馬達混控
+                    double vec[4] = {U1, U2, U3, U4};
+                    double res[4] = {0.0, 0.0, 0.0, 0.0};
+                    double mixM[4][4] = {
+                        {0.25,  1.866, -1.866, -14.434},
+                        {0.25,  1.866,  1.866,  14.434},
+                        {0.25, -1.866,  1.866, -14.434},
+                        {0.25, -1.866, -1.866,  14.434}
+                    };
+                    for (int i = 0; i < 4; i++)
+                        for (int j = 0; j < 4; j++)
+                            res[i] += mixM[i][j] * vec[j];
+
+                    double force_1 = res[0], force_2 = res[1], force_3 = res[2], force_4 = res[3];
+
+                    // 力限制
+                    if (force_1 > max_force) force_1 = max_force; else if (force_1 < min_force) force_1 = min_force;
+                    if (force_2 > max_force) force_2 = max_force; else if (force_2 < min_force) force_2 = min_force;
+                    if (force_3 > max_force) force_3 = max_force; else if (force_3 < min_force) force_3 = min_force;
+                    if (force_4 > max_force) force_4 = max_force; else if (force_4 < min_force) force_4 = min_force;
+
+                    // 力→PWM
+                    auto force_to_pwm = [](double f) {
+                        return 33.8543 * f + 491.7733;
+                    };
+
+                    double rotor_sign_1 = force_to_pwm(force_1);
+                    double rotor_sign_2 = force_to_pwm(force_2);
+                    double rotor_sign_3 = force_to_pwm(force_3);
+                    double rotor_sign_4 = force_to_pwm(force_4);
+
+                    // PWM 限制
+                    if (rotor_sign_1 > max_sign) rotor_sign_1 = max_sign; else if (rotor_sign_1 < min_sign) rotor_sign_1 = min_sign;
+                    if (rotor_sign_2 > max_sign) rotor_sign_2 = max_sign; else if (rotor_sign_2 < min_sign) rotor_sign_2 = min_sign;
+                    if (rotor_sign_3 > max_sign) rotor_sign_3 = max_sign; else if (rotor_sign_3 < min_sign) rotor_sign_3 = min_sign;
+                    if (rotor_sign_4 > max_sign) rotor_sign_4 = max_sign; else if (rotor_sign_4 < min_sign) rotor_sign_4 = min_sign;
+
+                    // 估計轉速、合成 omega
+                    auto pwm_to_speed = [](double pwm) {
+                        return (pwm - 343.464) / 0.3699;
+                    };
+
+                    double rotor_speed_1 = pwm_to_speed(rotor_sign_1);
+                    double rotor_speed_2 = pwm_to_speed(rotor_sign_2);
+                    double rotor_speed_3 = pwm_to_speed(rotor_sign_3);
+                    double rotor_speed_4 = pwm_to_speed(rotor_sign_4);
+
+                    omega = -rotor_speed_1 + rotor_speed_2 - rotor_speed_3 + rotor_speed_4;
+
+                    // 更新 NDOB（姿態）
+                    ndob_phi(phi_Dot, theta_Dot, psi_Dot, dt_attitude, uphi, omega, z_phi, d_phi, z_phi_new, L[3]);
+                    ndob_theta(phi_Dot, theta_Dot, psi_Dot, dt_attitude, utheta, omega, z_theta, d_theta, z_theta_new, L[4]);
+                    ndob_psi(phi_Dot, theta_Dot, psi_Dot, dt_attitude, upsi, omega, z_psi, d_psi, z_psi_new, L[5]);
+                    z_phi = z_phi_new; z_theta = z_theta_new; z_psi = z_psi_new;
+
+                    // 輸出 PWM
+                    int pwm1 = std::round(rotor_sign_1);
+                    int pwm2 = std::round(rotor_sign_2);
+                    int pwm3 = std::round(rotor_sign_3);
+                    int pwm4 = std::round(rotor_sign_4);
+                    setPWM(file, 1, 0, pwm1);
+                    setPWM(file, 2, 0, pwm2);
+                    setPWM(file, 3, 0, pwm3);
+                    setPWM(file, 4, 0, pwm4);
+
+                    // ====== 姿態記錄（每 5 次一筆）======
+                    static int log_counter = 0;
+                    const int log_frequency = 5;
+                    log_counter++;
+                    if (log_counter >= log_frequency) {
+                        log_counter = 0;
+                        VariablesGroup a1 = {{"index : "}, {static_cast<double>(index_attitude)}};
+                        VariablesGroup a2 = {{"att(deg) :"}, {phi * 180/M_PI, theta * 180/M_PI, psi * 180/M_PI}};
+                        VariablesGroup a3 = {{"att_dot : "}, {phi_Dot, theta_Dot, psi_Dot}};
+                        VariablesGroup a4 = {{"dist phi theta psi : "}, {d_phi, d_theta, d_psi}};
+                        VariablesGroup a5 = {{"err(deg) : "}, {(phi - phi_command) * 180/M_PI, (theta - theta_command)*180/M_PI, (psi - psi_command)*180/M_PI}};
+                        VariablesGroup a6 = {{"dt : "}, {dt_attitude}};
+                        VariablesGroup a7 = {{"U1 U2 U3 U4 : "}, {U1, U2, U3, U4}};
+                        VariablesGroup a8 = {{"cmd_dot : "}, {phi_command_Dot, theta_command_Dot, psi_command_Dot}};
+                        VariablesGroup a9 = {{"cmd_ddot : "}, {phi_command_sec_Dot, theta_command_sec_Dot, psi_command_sec_Dot}};
+                        VariablesGroup a10 = {{"pwm sign : "}, {pwm1, pwm2, pwm3, pwm4}};
+                        VariablesGroup aA = {{"------------------------------------------------------------"}, {}};
+                        writeGroup(buffer_outFile2, a1);
+                        writeGroup(buffer_outFile2, a2);
+                        writeGroup(buffer_outFile2, a3);
+                        writeGroup(buffer_outFile2, a4);
+                        writeGroup(buffer_outFile2, a5);
+                        writeGroup(buffer_outFile2, a6);
+                        writeGroup(buffer_outFile2, a7);
+                        writeGroup(buffer_outFile2, a8);
+                        writeGroup(buffer_outFile2, a9);
+                        writeGroup(buffer_outFile2, a10);
+                        writeGroup(buffer_outFile2, aA);
+
+                        index_attitude++;
+                    }
+                }
+            }
+
+            last_attitude_update = now;
+        }
+
+        // Emergency（IMU/姿態/XY 超界）
+        if (motors_on && (imu_loss_detected || attitude_invalid || xy_exceeded || z_exceeded || z_vel_exceeded)) {
+            std::cerr << "Emergency: ";
+            if (imu_loss_detected)  std::cerr << "[IMU lost] ";
+            if (attitude_invalid)   std::cerr << "[Attitude invalid] ";
+            if (xy_exceeded)        std::cerr << "[XY drift > " << XY_RADIUS_LIMIT << " m] ";
+            if (z_exceeded)         std::cerr << "[Z drift > "  << Z_RADIUS_LIMIT  << " m] ";
+            if (z_vel_exceeded)      std::cerr << "[Z velocity > " << Z_VELOCITY_LIMIT << " m/s] ";
+            std::cerr << "Shutting down motors.\n";
+            setPWM(file, 1, 0, 400);
+            setPWM(file, 2, 0, 400);
+            setPWM(file, 3, 0, 400);
+            setPWM(file, 4, 0, 400);
+            motors_on = false;
+            control_mode_on = false;
+            gps_fallback_active = false;
+        }
+
+        buffer_flush_counter++;
+        if (buffer_flush_counter >= buffer_flush_frequency) {
+            if (buffer_outFile1.tellp() > 0) {
+                outFile1 << buffer_outFile1.str(); outFile1.flush();
+                buffer_outFile1.str(""); buffer_outFile1.clear();
+            }
+            if (buffer_outFile2.tellp() > 0) {
+                outFile2 << buffer_outFile2.str(); outFile2.flush();
+                buffer_outFile2.str(""); buffer_outFile2.clear();
+            }
+            buffer_flush_counter = 0;
+        }
+
+        // === 補足至 10ms 週期（100 Hz）===
+        auto loop_end = std::chrono::steady_clock::now();
+        auto loop_duration = std::chrono::duration_cast<std::chrono::microseconds>(loop_end - loop_start);
+        auto sleep_time = std::chrono::milliseconds(10) - loop_duration; // 在這裡更改值以調整主迴圈頻率
+        if (sleep_time > std::chrono::microseconds(0)) {
+            std::this_thread::sleep_for(sleep_time);
+        } else {
+            // 若本圈耗時超過10ms，偶爾印出警告
+            static int warning_counter = 0;
+            warning_counter++;
+            if (warning_counter % 50 == 0) {
+                std::cerr << "⚠️ Loop overrun! Took "
+                          << loop_duration.count() / 1000.0 << " ms\n";
+            }
+        }
+    }
+
+    if (buffer_outFile1.tellp() > 0) { outFile1 << buffer_outFile1.str(); outFile1.flush(); }
+    if (buffer_outFile2.tellp() > 0) { outFile2 << buffer_outFile2.str(); outFile2.flush(); }
+    outFile1.close(); outFile2.close();
+}
+
+void spinThread(std::shared_ptr<MultiTopicSubscriber> node) {
+    while (rclcpp::ok() && running) {
+        rclcpp::spin_some(node);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 int main(int argc, char *argv[]) {
     std::signal(SIGINT, signal_handler);
+
+    // I2C init
     const char *filename = "/dev/i2c-7";
     int file = open(filename, O_RDWR);
-    if (file < 0) {
-        std::cerr << "Failed to open the i2c bus\n";
-        return 1;
-    }
-
+    if (file < 0) { std::cerr << "Failed to open the i2c bus\n"; return 1; }
     if (ioctl(file, I2C_SLAVE, PCA9685_ADDRESS) < 0) {
-        std::cerr << "Failed to acquire bus access and/or talk to slave.\n";
-        return 1;
+        std::cerr << "Failed to acquire bus access and/or talk to slave.\n"; return 1;
     }
-
-    // Initialize the PCA9685
-    writeRegister(file, MODE1, 0x00); // Normal mode
-    setPWMFreq(file, 100);             // Set frequency to 50 Hz
-    setPWM(file, 0, 0, 400); 
-    setPWM(file, 1, 0, 400); 
-    setPWM(file, 2, 0, 400); 
+    writeRegister(file, MODE1, 0x00);
+    setPWMFreq(file, 100);
+    setPWM(file, 0, 0, 400);
+    setPWM(file, 1, 0, 400);
+    setPWM(file, 2, 0, 400);
     setPWM(file, 3, 0, 400);
-    setPWM(file, 4, 0, 400);  
-    std::cout << "gogogogogo "  << std::endl;
-    sleep(3);
+    setPWM(file, 4, 0, 400);
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    // log 檔名
     auto now = std::chrono::system_clock::now();
     std::time_t time = std::chrono::system_clock::to_time_t(now);
-
     std::stringstream ss;
     ss << std::put_time(std::localtime(&time), "%Y-%m-%d_%H-%M-%S");
     std::string timestamp = ss.str();
-
-    // Construct file paths
-    std::string filePath1 = "/home/dodo/position_log_" + timestamp + ".txt";
-    std::string filePath2 = "/home/dodo/attitude_log_" + timestamp + ".txt";
-
-    // std::string filePath1= "/home/dodo/position_log.txt";
-    // std::string filePath2= "/home/dodo/attitude_log.txt";
-
+    std::string filePath1 = "/home/dodo/UAV_log/position_log " + timestamp + ".txt";
     std::ofstream outFile1(filePath1);
+    if (!outFile1) { std::cerr << "Unable to open " << filePath1 << "\n"; return 1; }
+    std::string filePath2 = "/home/dodo/UAV_log/attitude_log " + timestamp + ".txt";
     std::ofstream outFile2(filePath2);
-        
-    if (!outFile1) {
-    std::cerr << "Unable to open file at " << filePath1 << std::endl;
-    return 1;
-    }
-    if (!outFile2) {
-    std::cerr << "Unable to open file at " << filePath2 << std::endl;
-    return 1;
-    }
+    if (!outFile2) { std::cerr << "Unable to open " << filePath2 << "\n"; return 1; }
 
-
-
-
-
+    // ROS2
     rclcpp::init(argc, argv);
-    auto node=std::make_shared<MultiTopicSubscriber>();
-    std::thread inputThread(commandInputThread);
-    std::thread controlThread(droneControlThread,file,node,std::ref(outFile1),std::ref(outFile2));
-    while (rclcpp::ok()) {
-    rclcpp::spin_some(node);
-}
-    inputThread.join();
-    controlThread.join();
-    setPWM(file, 0, 0, 0); 
-    setPWM(file, 1, 0, 0); 
-    setPWM(file, 2, 0, 0); 
-    setPWM(file, 3, 0, 0);
-    setPWM(file, 4, 0, 0); 
-    usleep(10000);
-    std::cout << "stop "  << std::endl;
-    close(file);
-    outFile1.close();
-    outFile2.close();
+    auto node = std::make_shared<MultiTopicSubscriber>();
+    std::thread spin_thread(spinThread, node);
+    std::thread sbusThreadObj(sbusThread);
+    std::thread controlThread(droneControlThread, file, node, std::ref(outFile1), std::ref(outFile2));
 
+    if (spin_thread.joinable()) spin_thread.join();
+    if (sbusThreadObj.joinable()) sbusThreadObj.join();
+    if (controlThread.joinable()) controlThread.join();    
+
+    setPWM(file, 0, 0, 0);
+    setPWM(file, 1, 0, 0);
+    setPWM(file, 2, 0, 0);
+    setPWM(file, 3, 0, 0);
+    setPWM(file, 4, 0, 0);
+    usleep(10000);
+    std::cout << "stop\n";
+    close(file);
     return 0;
 }
