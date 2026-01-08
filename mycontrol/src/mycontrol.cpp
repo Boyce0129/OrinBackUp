@@ -1,26 +1,5 @@
 // ============================ CHANGELOG =====================================
 // [A] 採用ENU坐標系，IMU和GPS皆在本程式轉換
-//
-// [B] - 到點判定只看 z
-//
-// [D] 指令介面：'on' / 'l' / 'run' / <z>
-//
-// [E] GPS 丟失新邏輯（取代舊的 gps_loss_detected）：
-//     - 在懸停或移動模式下，一旦判定 GPS 丟失：啟動 fallback，將總推力 U1 = 17.65 N，
-//       不再依靠 z_command 做控制，phi/theta 命令維持 0，z_target 不變。
-//     - GPS 恢復：若在懸停 → 取消 fallback、恢復 Z 控制器；
-//                若在移動 → 取消 fallback、將 z_command 置為目前高度，vz_ref=0，
-//                               讓斜坡器從「當前高度」再次朝 z_target 移動。
-//
-// [f] 輸入run之後，z_command = z_target直接設為0.1(直接hovering)
-//
-// [g] 更新迴圈頻率偵測邏輯，目前為「每運行50個迴圈，便打印當前迴圈與上一個迴圈的間隔時間」
-//     CTRL+F「sleep_time」以調整主迴圈頻率(即姿態迴圈頻率)
-//     注意，主迴圈頻率更改後，位置控制迴圈頻率也會更改
-//
-// [h] 加入水平位置控制器且固定為 x = y = 0 且不可使用指令更改
-//
-// [I] 加入了Z軸方向的PID控制
 // ============================================================================
 
 #include <iostream>
@@ -37,6 +16,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <csignal>
 #include <sys/select.h>
 #include <fcntl.h>
@@ -219,6 +199,19 @@ void quaternionToEuler(float qx, float qy, float qz, float qw, float& roll, floa
     yaw   = (-1) * std::atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
 }
 
+static inline double wrapToPi(double a) {
+    a = std::fmod(a + M_PI, 2.0 * M_PI);
+    if (a < 0) a += 2.0 * M_PI;
+    return a - M_PI;
+}
+
+// prev_unwrapped 是連續角；new_wrapped 是 (-pi, pi] 的角
+static inline double unwrapAngle(double prev_unwrapped, double new_wrapped) {
+    // 用 prev 的「當前 wrap」來算最短角差
+    double prev_wrapped = wrapToPi(prev_unwrapped);
+    double delta = wrapToPi(new_wrapped - prev_wrapped);
+    return prev_unwrapped + delta;
+}
 
 // ====== NDOB ======
 void ndob_x(double x_Dot, double phi, double theta, double psi, double dt, double U1, double z_x_old, double& d_x, double& z_x, double l_x) {
@@ -265,6 +258,15 @@ void ndob_psi(double phi_Dot, double theta_Dot, double psi_Dot, double dt, doubl
 }
 
 std::atomic<float> ch_norm[5];
+
+static inline float apply_deadband(float x, float db = 0.05f) { // 設定遙控器的deadband
+    if (db <= 0.0f) return x;
+    float ax = std::fabs(x);
+    if (ax <= db) return 0.0f;
+
+    float sign = (x >= 0.0f) ? 1.0f : -1.0f; // 有做 rescale ，+-0.2範圍內還是有值
+    return sign * ((ax - db) / (1.0f - db));
+}
 
 void init_sbus_vars() {
     for (int i = 0; i < 5; ++i) {
@@ -397,11 +399,19 @@ void sbusThread() {
         for (int i = 1; i <= 33; ++i) xor_val ^= frame[i];
         if (xor_val != frame[34]) continue;
 
-        // 解析並正規化通道數據
+        // 解析並正規化通道數據 + deadband（只對 CH0/1/2）
         for (int i = 0; i < 5; ++i) {
             uint16_t raw = (uint16_t(frame[1 + 2 * i]) << 8) | frame[2 + 2 * i];
             float scale = 2.0f / float(raw_max[i] - raw_min[i]);
-            ch_norm[i] = (raw - raw_min[i]) * scale - 1.0f;
+
+            float v = (raw - raw_min[i]) * scale - 1.0f;   // 原本的正規化
+
+            // CH0/1/2：加 deadband = 0.2；CH4（switching）不動，避免破壞你的門檻判斷
+            if (i == 0 || i == 1 || i == 2) {
+                v = apply_deadband(v, 0.2f);
+            }
+
+            ch_norm[i].store(v);
         }
 
         // 首次接收到有效幀
@@ -479,8 +489,10 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
     // 位置狀態（只需 z，x/y 讀回但不控制）
     double current_x = 0.0, current_y = 0.0, current_z = 0.0;
 
-    // 姿態量測
-    float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+    // 姿態量測：roll/pitch 用原本；yaw 改用 psi（連續角）
+    float roll = 0.0f, pitch = 0.0f;
+    double psi = 0.0;     // 連續角（相對 psi0）
+    double psi0 = 0.0;    // 初始化 100 筆平均得到的偏移（wrapped）
 
     // GPS 新/舊時間戳追蹤（新的 GPS 丟失偵測法）
     double last_gps_timestamp_seen = 0.0;
@@ -492,7 +504,7 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
     bool control_mode_on = false, motors_on = false;
 
     // ====== 目標與命令 ======
-    double x_target = 0.0, y_target = 0.0, z_target = 0.0;
+    double x_target = 0.0, y_target = 0.0, z_target = 0.2;
     double x_command = 0.0, y_command = 0.0, z_command = 0.0;
 
     static double stored_uz = 0.0;
@@ -525,7 +537,7 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
     const double attitude_command_bound_sec_derivative = 31.4159;
 
     // SMC gains
-    std::vector<double> C = {2, 2, 1, 4, 4, 4};
+    std::vector<double> C = {1.5, 1.5, 1, 4, 4, 4};
     std::vector<double> K = {2, 2, 1, 6, 6, 3};
     std::vector<double> Eta = {0.1, 0.1, 0.1, 0.1, 0.1, 0.1};
     std::vector<double> L = {1, 1, 1, 7, 7, 3};
@@ -606,7 +618,7 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
 
     // SUBS相關參數
     float xy_bound = 0.5; //m
-    float z_bound = 0.2; //m
+    float z_bound = 3.0; //m
 
 
     while (ch_norm[4].load() >= -0.8f && running) {
@@ -619,19 +631,34 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
         }
     }
 
-    // 初始化 psi_command
+    // 初始化 psi0：取 100 筆 IMU yaw 的 circular mean，避免跨 ±pi 平均錯
     float initial_roll, initial_pitch, initial_yaw;
-    psi_command = 0.0;
+    double sum_sin = 0.0, sum_cos = 0.0;
+
     for (int i = 0; i < 100; i++) {
-        while (!node->new_imu_data_available()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        while (!node->new_imu_data_available())
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
         auto initial_imu_data = node->get_last_imu_data();
         quaternionToEuler(initial_imu_data.orientation.x, initial_imu_data.orientation.y,
                           initial_imu_data.orientation.z, initial_imu_data.orientation.w,
                           initial_roll, initial_pitch, initial_yaw);
-        psi_command += initial_yaw;
-    }
-    psi_command_initial = psi_command / 100.0;
 
+        sum_sin += std::sin((double)initial_yaw);
+        sum_cos += std::cos((double)initial_yaw);
+    }
+
+    // psi0 是「初始機頭方向」（wrapped）
+    psi0 = std::atan2(sum_sin, sum_cos);
+
+    // 三大目標 #2：初始 psi_command 平移到 0 度
+    psi_command_initial = 0.0;
+    psi_command = psi_command_initial;
+
+    // 三大目標 #3：IMU 量到的 psi 以相對 psi_command_initial 表示（所以一開始 psi=0）
+    psi = 0.0;
+
+    
     // 等待第一筆 GPS
     while (node->get_last_gps_timestamp() == 0.0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -640,10 +667,8 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
     last_gps_timestamp_seen = node->get_last_gps_timestamp();
     last_gps_wallclock     = std::chrono::high_resolution_clock::now();
 
-    std::cout << "Init successful. psi_command_initial = "<< psi_command_initial*180/M_PI <<"\n";
-    if (psi_command_initial*180/M_PI < -150 || psi_command_initial*180/M_PI > 150) {
-        std::cout << "⚠️Warning: psi_command_initial is approaching ±180 degrees.\n";
-    }
+    std::cout << "Init successful. psi0(IMU avg) = " << psi0 * 180 / M_PI
+              << " deg, psi_command_initial = 0 deg\n";
     auto writeGroup = [](std::stringstream& buffer, const VariablesGroup& group) {
         for (const auto& name : group.names) buffer << name << " ";
         for (const auto& var : group.group) buffer << var << " ";
@@ -675,10 +700,7 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
 
         // SUBS相關參數
         static std::string last_mode = "off";  // 記錄上一次狀態，避免重複觸發
-        float x_in   = ch_norm[1];
-        float y_in  = ch_norm[0];
-        float z_in  = ch_norm[2];
-        float switching = ch_norm[4];
+        float switching = ch_norm[4].load();
         
 
         if (switching >= -0.5f && switching <= -0.4f && last_mode != "motor_on") {
@@ -783,6 +805,7 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
                 if (!gps_ok_now && !gps_fallback_active) {
                     // 進入 fallback
                     gps_fallback_active = true;
+                    psi_command = psi;
                     std::cout << "GPS LOST → Fallback: set U1=17.65N, keep level, z_target unchanged.\n";
                 } else if (gps_ok_now && gps_fallback_active) {
                     // 離開 fallback，恢復 Z 控制器
@@ -790,7 +813,8 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
                     // 以「當前高度」為新起點
                     double cz;
                     { std::lock_guard<std::mutex> lock(dataMutex); cz = current_z; }
-                    z_command = cz;
+                    z_target = cz;
+                    z_command = z_target;
                 }
             } else {
                 // 非控制模式 → 確保 fallback 關閉
@@ -800,8 +824,8 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
             // --- 只有 GPS 正常且在控制模式才更新 Z 控制器 ---
             if (gps_ok_now && control_mode_on) {
                 auto imu_data = node->get_last_imu_data();
-                float phi, theta, psi;
-                quaternionToEuler(imu_data.orientation.x, imu_data.orientation.y, imu_data.orientation.z, imu_data.orientation.w, phi, theta, psi);
+                float phi, theta, psi_raw;
+                quaternionToEuler(imu_data.orientation.x, imu_data.orientation.y, imu_data.orientation.z, imu_data.orientation.w, phi, theta, psi_raw);
 
                 // 用 GPS header timestamp 估 dt（與舊版一致）
                 auto gps_data = node->get_last_gps_data();
@@ -811,13 +835,9 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
                 if (dt_position <= 0) dt_position = 0.1;
                 else if (dt_position > 0.2) dt_position = 0.2;
 
-                float x_in = ch_norm[1].load();
-                float y_in = ch_norm[0].load();
-                float z_in = ch_norm[2].load();
-
-                x_command = x_in * xy_bound;
-                y_command = y_in * xy_bound;
-                z_command = 0.2 + z_in * z_bound;
+                x_command = x_target;
+                y_command = y_target;
+                z_command = z_target;
 
                 // -------- z 命令導數與夾限 --------
                 z_command_Derivative.updateDt(dt_position);
@@ -878,36 +898,13 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
                 double ux = -C[0] * x_e_Dot + Cv * (current_x_Dot / m) + x_command_sec_Dot - K[0] * sx - Eta[0] * sx_sat - d_x;
                 double uy = -C[1] * y_e_Dot + Cv * (current_y_Dot / m) + y_command_sec_Dot - K[1] * sy - Eta[1] * sy_sat - d_y;
                 double uz = -C[2] * z_e_Dot + Cv * (current_z_Dot / m) + z_command_sec_Dot - K[2] * sz - Eta[2] * sz_sat + g - d_z;
-
-
-                //高度PID控制///////////////////////////////////////////////////////////////
-
-                // // 外圈P控制：計算位置誤差，並根據誤差計算期望的速度
-                // double vz = - PID[0]* z_e; // 位置控制誤差 -> 目標速度
-                // if (std::fabs(z_e) < 0.05) vz = 0;
-
-                // // 內圈PID控制：計算速度誤差，並根據誤差調整推力
-                // double vz_e = vz - current_z_Dot; // 計算速度誤差
-
-                // I_vz_e += vz_e * dt_position;     // 累積誤差（積分項）
-                // // 積分項飽和處理，防止積分風暴
-                // if (I_vz_e > PID[4]) I_vz_e = PID[4];
-                // else if (I_vz_e < PID[5]) I_vz_e = PID[5];
-
-                // // 使用 FOHPDerivative 計算微分項
-                // double D_vz_e = vz_e_derivative.update(vz_e);  // 使用 FOHPDerivative 計算微分項
-
-                // // 計算推力（Uz），加入重力補償
-                // double uz = g + (PID[1] * vz_e) + (PID[2] * I_vz_e) + (PID[3] * D_vz_e);
-
-                //高度PID控制///////////////////////////////////////////////////////////////
                 
-
                 if (std::abs(uz) < 1e-6) uz = 1e-6;
 
                 // 由 ux/uy/uz 轉姿態命令
-                phi_command = atan2(- uy , uz);
-                theta_command = atan2(ux , uz); // 無人機頭朝正北的假設下的簡化
+                phi_command   = atan2(ux*sin(psi_command) - uy*cos(psi_command), uz);
+                theta_command = atan2(ux*cos(psi_command) + uy*sin(psi_command), uz);
+
 
                 stored_uz = uz;
 
@@ -923,8 +920,7 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
                 VariablesGroup g9 = {{"ux uy uz : "}, {ux, uy, uz}};
                 VariablesGroup g10= {{"target : "}, {x_target, y_target, z_target}};
                 VariablesGroup g11= {{"attitude cmd(deg) : "}, {phi_command * 180.0 / M_PI, theta_command * 180.0 / M_PI, psi_command * 180.0 / M_PI}};
-                //VariablesGroup g12={{"目標速度、目標速度誤差、累積誤差、微分誤差"}, {vz, vz_e, I_vz_e, D_vz_e}};
-                VariablesGroup g13= {{"------------------------------------------------------------"}, {}};
+                VariablesGroup g12= {{"------------------------------------------------------------"}, {}};
 
                 writeGroup(buffer_outFile1, g1);
                 writeGroup(buffer_outFile1, g2);
@@ -937,8 +933,7 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
                 writeGroup(buffer_outFile1, g9);
                 writeGroup(buffer_outFile1, g10);
                 writeGroup(buffer_outFile1, g11);
-                //writeGroup(buffer_outFile1, g12);
-                writeGroup(buffer_outFile1, g13);
+                writeGroup(buffer_outFile1, g12);
 
 
                 index_position++;
@@ -962,9 +957,12 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
                 if (dt_attitude <= 0) dt_attitude = 0.01;
                 else if (dt_attitude > 0.05) dt_attitude = 0.05;
 
-                float phi = 0.0f, theta = 0.0f, psi = 0.0f;
-                quaternionToEuler(imu_data.orientation.x, imu_data.orientation.y, imu_data.orientation.z, imu_data.orientation.w, phi, theta, psi);
-                roll = phi; pitch = theta; yaw = psi;
+                float phi = 0.0f, theta = 0.0f, psi_raw = 0.0f;
+                quaternionToEuler(imu_data.orientation.x, imu_data.orientation.y, imu_data.orientation.z, imu_data.orientation.w, phi, theta, psi_raw);
+                roll = phi; pitch = theta;
+                // 相對化 + 連續角（存回 psi）
+                double psi_wrapped_rel = wrapToPi((double)psi_raw - psi0);
+                psi = unwrapAngle(psi, psi_wrapped_rel);
 
                 {
                     std::lock_guard<std::mutex> lock(dataMutex);
@@ -1043,17 +1041,16 @@ void droneControlThread(int file, const std::shared_ptr<MultiTopicSubscriber>& n
 
                     // === 關鍵：U1 在 GPS fallback 下改為 17.65 N，否則用 z 控制器的 stored_uz ===
                     if (gps_fallback_active) {
-                        U1 = WEIGHT_FORCE;                 // 直接給總推力
+                        U1 = WEIGHT_FORCE + ch_norm[2].load() * z_bound;                 // 直接給總推力
                         // 同時維持水平命令
                         theta_command = 0.0;
                         phi_command   = 0.0;
-                        psi_command   = psi_command_initial;
                     } else {
-                        U1 = (stored_uz * m) / cos_product; // 正常情況
+                        U1 = (stored_uz * m) / cos_product + ch_norm[2].load() * z_bound; // 正常情況
                     }
 
-                    U2 = uphi   * Ixx;
-                    U3 = utheta * Iyy;
+                    U2 = uphi   * Ixx  + ch_norm[1].load() * xy_bound;
+                    U3 = utheta * Iyy  + ch_norm[0].load() * xy_bound;
                     U4 = upsi   * Izz;
 
                     // 馬達混控

@@ -176,7 +176,7 @@ class RtkGpsNode(Node):
                         last_acc_print_time = now
 
                 if not self.ref_ready and time.time() - self.start_time > 5:
-                    if carr_soln == 2:
+                    if carr_soln == 2: # 訊號不好時，可用「if carr_soln in (1, 2):」
                         self.ref_buf.append((lat_deg, lon_deg, h_m))
                         if len(self.ref_buf) == self.ref_buf.maxlen:
                             self.ref_lat = np.mean([x[0] for x in self.ref_buf])
